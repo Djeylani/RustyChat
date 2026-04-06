@@ -26,15 +26,17 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
 
 ## Phase 4: Architectural Integrity (The "Foundation") ✅
 - [x] **Modularization:** Split `main.rs` into `db`, `ui`, `ollama`, and `rag`.
-- [ ] **Error Handling:** Centralized error logging and user notifications.
+- [x] **Shared Notifications:** Add centralized in-app toast notifications for major success/error states.
+- [ ] **Error Handling:** Centralized error logging and broader notification cleanup across all flows.
 - [ ] **State Management:** Optimize Dioxus signals for large conversation histories.
-- [ ] **File & Folder Sharing:** Let users attach files and folders directly into chat flows, not only RAG indexing.
-- [ ] **Image Sharing:** Support image attachment/upload in chat and render image messages cleanly.
-- [ ] **Multimodal Pipeline:** Pass attached images/files to models or tool flows that can actually consume them.
+- [x] **File Sharing:** Let users attach files directly into chat flows with previews and prompt injection for text files.
+- [ ] **Folder Sharing:** Let users attach folders directly into chat flows, not only RAG indexing.
+- [x] **Image Sharing:** Support image attachment/upload in chat and render image messages cleanly.
+- [x] **Multimodal Pipeline:** Pass attached images to Ollama chat requests for vision-capable models.
 - [ ] **MCP Integrations UX:** Support multiple MCP integrations with structured config, auth/env fields, and validation.
 - [ ] **Tool-Friendly Results:** Add richer result views for common MCP/file operations instead of raw text-first outputs.
 - [ ] **Execution Safety:** Add sandboxing or a safer execution boundary for the inline code runner.
 - [ ] **Long-History Performance:** Add virtualization or equivalent rendering strategy for very large chats.
 
 ---
-*Status: ⚙️ Phases 1-3 complete. Phase 4 focuses on product hardening, richer attachments, safer execution, and scalability.*
+*Status: ⚙️ Phases 1-3 complete. Phase 4 is in progress, with attachments, vision wiring, and shared notifications started; remaining work focuses on hardening, scalability, and safer tool execution.*

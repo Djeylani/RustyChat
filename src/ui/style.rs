@@ -1349,6 +1349,82 @@ main {
     background: rgba(239, 68, 68, 0.1);
 }
 
+.toast-host {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 120;
+    pointer-events: none;
+}
+
+.toast-card {
+    width: min(360px, calc(100vw - 36px));
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 14px 14px 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(10, 12, 20, 0.92);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+    pointer-events: auto;
+    backdrop-filter: blur(10px);
+}
+
+.toast-info {
+    border-color: rgba(59, 130, 246, 0.28);
+}
+
+.toast-success {
+    border-color: rgba(34, 197, 94, 0.28);
+}
+
+.toast-warning {
+    border-color: rgba(245, 158, 11, 0.28);
+}
+
+.toast-error {
+    border-color: rgba(239, 68, 68, 0.3);
+}
+
+.toast-copy {
+    min-width: 0;
+}
+
+.toast-copy strong {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text-pure);
+    font-size: 0.86rem;
+}
+
+.toast-copy p {
+    margin: 0;
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 0.78rem;
+    line-height: 1.55;
+}
+
+.toast-dismiss {
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+    border: none;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-soft);
+    cursor: pointer;
+    flex: 0 0 auto;
+}
+
+.toast-dismiss:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: var(--text-pure);
+}
+
 @media (max-width: 980px) {
     .chat-messages {
         padding: 32px 0 24px 0;
@@ -1369,6 +1445,11 @@ main {
         right: 12px;
         bottom: 12px;
         width: min(430px, calc(100% - 24px));
+    }
+
+    .toast-host {
+        top: 12px;
+        right: 12px;
     }
 }
 

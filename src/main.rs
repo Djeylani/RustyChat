@@ -5,7 +5,7 @@ use dioxus::desktop::{Config, WindowBuilder, LogicalSize};
 use rusqlite::params;
 use uuid::Uuid;
 use crate::db::{init_db, load_settings};
-use crate::ui::{Sidebar, ChatWindow, SettingsModal, CSS};
+use crate::ui::{Sidebar, ChatWindow, SettingsModal, ToastHost, CSS};
 
 mod db;
 mod ollama;
@@ -38,6 +38,7 @@ fn App() -> Element {
     let chats = use_signal(|| Vec::<(String, String)>::new());
     let current_chat_id = use_signal(|| Option::<String>::None);
     let messages = use_signal(|| Vec::<(String, String)>::new());
+    let toasts = use_signal(|| Vec::new());
 
     // settings and modal visibility
     let settings = use_signal(|| load_settings(&conn));
@@ -125,7 +126,8 @@ fn App() -> Element {
                     current_chat_id: current_chat_id.clone(),
                     messages: messages.clone(),
                     settings: settings.clone(),
-                    chats: chats.clone()
+                    chats: chats.clone(),
+                    toasts: toasts.clone()
                 }
             }
 
@@ -135,9 +137,12 @@ fn App() -> Element {
                     show_settings: show_settings.clone(),
                     chats: chats.clone(),
                     messages: messages.clone(),
-                    current_chat_id: current_chat_id.clone()
+                    current_chat_id: current_chat_id.clone(),
+                    toasts: toasts.clone()
                 }
             }
+
+            ToastHost { toasts: toasts.clone() }
         }
     }
 }

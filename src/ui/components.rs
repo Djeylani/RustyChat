@@ -26,6 +26,22 @@ const MAX_TITLE_LEN: usize = 255;
 const ATTACHMENTS_PREFIX: &str = "<rustychat-attachments>";
 const ATTACHMENTS_SUFFIX: &str = "</rustychat-attachments>";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToastNotification {
+    id: String,
+    kind: ToastKind,
+    title: String,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ChatAttachment {
     path: String,
@@ -242,6 +258,26 @@ fn render_message_for_model(content: &str) -> (String, Vec<String>) {
     (text, images)
 }
 
+fn push_toast(
+    mut toasts: Signal<Vec<ToastNotification>>,
+    kind: ToastKind,
+    title: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let id = Uuid::new_v4().to_string();
+    toasts.push(ToastNotification {
+        id: id.clone(),
+        kind,
+        title: title.into(),
+        message: message.into(),
+    });
+
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        toasts.retain(|toast| toast.id != id);
+    });
+}
+
 fn parse_mcp_tools_listing(listing: &str) -> Vec<(String, String)> {
     listing
         .lines()
@@ -367,6 +403,7 @@ pub fn SettingsModal(
     chats: Signal<Vec<(String, String)>>,
     messages: Signal<Vec<(String, String)>>,
     current_chat_id: Signal<Option<String>>,
+    toasts: Signal<Vec<ToastNotification>>,
 ) -> Element {
     // local editable copies using signals
     let mut local_model = use_signal(|| settings().model.clone());
@@ -505,6 +542,12 @@ pub fn SettingsModal(
             save_settings(&conn, &new_settings);
             settings.set(new_settings);
             show_settings.set(false);
+            push_toast(
+                toasts,
+                ToastKind::Success,
+                "Settings updated",
+                "Your model, MCP, and app preferences were saved.",
+            );
         }
     };
 
@@ -866,6 +909,7 @@ pub fn ChatWindow(
     messages: Signal<Vec<(String, String)>>,
     settings: Signal<Settings>,
     chats: Signal<Vec<(String, String)>>,
+    toasts: Signal<Vec<ToastNotification>>,
 ) -> Element {
     let mut input_text = use_signal(|| "".to_string());
     let mut pending_attachments = use_signal(|| Vec::<ChatAttachment>::new());
@@ -967,7 +1011,8 @@ pub fn ChatWindow(
             mcp_tools_cache,
             mcp_last_error,
             mcp_tool_entries,
-            selected_mcp_tool
+            selected_mcp_tool,
+            toasts
         ];
         move |chat_id: String, command_text: String, user_echo: Option<String>| {
             if let Some(display_text) = user_echo {
@@ -1014,12 +1059,24 @@ pub fn ChatWindow(
                             mcp_tools_cache.set(Some(output.clone()));
                         }
                         rag_status.set(Some("MCP command completed.".to_string()));
+                        push_toast(
+                            toasts,
+                            ToastKind::Success,
+                            "MCP complete",
+                            "The MCP command finished successfully.",
+                        );
                         output
                     }
                     Err(err) => {
                         mcp_status.set(Some("error".to_string()));
                         mcp_last_error.set(Some(err.clone()));
                         rag_status.set(Some(format!("MCP command failed: {err}")));
+                        push_toast(
+                            toasts,
+                            ToastKind::Error,
+                            "MCP failed",
+                            err.clone(),
+                        );
                         format!("MCP Error: {err}")
                     }
                 };
@@ -1052,7 +1109,8 @@ pub fn ChatWindow(
             rag_status,
             mcp_status,
             mcp_tools_cache,
-            mcp_last_error
+            mcp_last_error,
+            toasts
         ];
         move |chat_id: String,
               history_snapshot: Vec<(String, String)>,
@@ -1078,6 +1136,12 @@ pub fn ChatWindow(
                         messages.push(("assistant".into(), db_msg.to_string()));
                     }
 
+                    push_toast(
+                        toasts,
+                        ToastKind::Warning,
+                        "Model required",
+                        "Choose an Ollama model in Settings before sending a message.",
+                    );
                     loading_chat.set(None);
                     current_cancel.set(None);
                     return;
@@ -1212,6 +1276,12 @@ pub fn ChatWindow(
                                     {
                                         messages.push(("assistant".into(), err_text.to_string()));
                                     }
+                                    push_toast(
+                                        toasts,
+                                        ToastKind::Error,
+                                        "Bad Ollama response",
+                                        "RustyChat could not parse the model response.",
+                                    );
                                 }
                             }
                         } else {
@@ -1238,6 +1308,12 @@ pub fn ChatWindow(
                                     ),
                                 ));
                             }
+                            push_toast(
+                                toasts,
+                                ToastKind::Error,
+                                "Ollama request failed",
+                                format!("The Ollama API returned status {}.", response.status()),
+                            );
                         }
                     }
                     Err(e) => {
@@ -1257,6 +1333,12 @@ pub fn ChatWindow(
                         {
                             messages.push(("assistant".into(), err_text.to_string()));
                         }
+                        push_toast(
+                            toasts,
+                            ToastKind::Error,
+                            "Ollama unavailable",
+                            "RustyChat could not connect to Ollama at http://localhost:11434.",
+                        );
                     }
                 }
 
@@ -1317,7 +1399,9 @@ pub fn ChatWindow(
             mcp_status,
             mcp_tools_cache,
             mcp_last_error,
-            pending_attachments
+            pending_attachments,
+            show_composer_tools,
+            toasts
         ];
         move || {
             if let Some(chat_id) = current_chat_id() {
@@ -1368,6 +1452,12 @@ pub fn ChatWindow(
                         );
                         enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
                         messages.push(("assistant".into(), local_reply));
+                        push_toast(
+                            toasts,
+                            ToastKind::Info,
+                            "MCP status",
+                            "Answered from cached MCP session state.",
+                        );
                         return;
                     }
                 }
@@ -1430,6 +1520,12 @@ pub fn ChatWindow(
                                 let cleared = clear_document_chunks(&conn);
                                 refresh_index_metrics();
                                 rag_status.set(Some(format!("Cleared {cleared} indexed document chunks.")));
+                                push_toast(
+                                    toasts,
+                                    ToastKind::Success,
+                                    "Index cleared",
+                                    format!("Removed {cleared} indexed document chunks."),
+                                );
                             },
                             "Clear Index"
                         }
@@ -1527,6 +1623,12 @@ pub fn ChatWindow(
                                         let embed_model = settings().embed_model.clone();
                                         if embed_model.trim().is_empty() {
                                             rag_status.set(Some("Choose an embedding model in Settings before indexing a folder.".to_string()));
+                                            push_toast(
+                                                toasts,
+                                                ToastKind::Warning,
+                                                "Embedding model required",
+                                                "Choose an embedding model in Settings before indexing a folder.",
+                                            );
                                             show_composer_tools.set(false);
                                             return;
                                         }
@@ -1536,6 +1638,7 @@ pub fn ChatWindow(
                                         let mut indexed_chunks = indexed_chunks.clone();
                                         let mut rag_status = rag_status.clone();
                                         let mut is_indexing = is_indexing.clone();
+                                        let toasts = toasts.clone();
                                         spawn(async move {
                                             let status = match index_directory(&path_str, &embed_model).await {
                                                 Ok(stats) => {
@@ -1545,11 +1648,26 @@ pub fn ChatWindow(
                                                     indexed_files.set(total_files);
                                                     indexed_chunks.set(total_chunks);
                                                     if stats.files_indexed == 0 || stats.chunks_indexed == 0 {
+                                                        push_toast(
+                                                            toasts,
+                                                            ToastKind::Warning,
+                                                            "Nothing indexed",
+                                                            "The selected folder did not contain supported text files.",
+                                                        );
                                                         format!(
                                                             "No supported text files were indexed from {}. Supported types: .rs, .md, .txt, .py, .js, .ts, .toml, .json, .c, .cpp, .h",
                                                             path_str
                                                         )
                                                     } else {
+                                                        push_toast(
+                                                            toasts,
+                                                            ToastKind::Success,
+                                                            "Folder indexed",
+                                                            format!(
+                                                                "Added {} files and {} chunks to the local index.",
+                                                                stats.files_indexed, stats.chunks_indexed
+                                                            ),
+                                                        );
                                                         format!(
                                                             "Indexed {} files and {} chunks from {} (replaced {} old chunks). Corpus now has {} files and {} chunks.",
                                                             stats.files_indexed,
@@ -1561,7 +1679,15 @@ pub fn ChatWindow(
                                                         )
                                                     }
                                                 }
-                                                Err(err) => format!("Indexing failed: {}", err),
+                                                Err(err) => {
+                                                    push_toast(
+                                                        toasts,
+                                                        ToastKind::Error,
+                                                        "Indexing failed",
+                                                        err.to_string(),
+                                                    );
+                                                    format!("Indexing failed: {}", err)
+                                                },
                                             };
                                             is_indexing.set(false);
                                             rag_status.set(Some(status));
@@ -1856,6 +1982,38 @@ pub fn Message(role: String, content: String) -> Element {
                     Markdown { content: body_content.clone() }
                 }
             }
+        }
+    }
+}
+
+#[component]
+pub fn ToastHost(toasts: Signal<Vec<ToastNotification>>) -> Element {
+    rsx! {
+        div { class: "toast-host",
+            {toasts().iter().map(|toast| {
+                let toast_id = toast.id.clone();
+                let toast_kind = match toast.kind {
+                    ToastKind::Info => "info",
+                    ToastKind::Success => "success",
+                    ToastKind::Warning => "warning",
+                    ToastKind::Error => "error",
+                };
+                let title = toast.title.clone();
+                let message = toast.message.clone();
+                rsx!(
+                    div { class: "toast-card toast-{toast_kind}",
+                        div { class: "toast-copy",
+                            strong { "{title}" }
+                            p { "{message}" }
+                        }
+                        button {
+                            class: "toast-dismiss",
+                            onclick: move |_| toasts.retain(|item| item.id != toast_id),
+                            "×"
+                        }
+                    }
+                )
+            })}
         }
     }
 }
