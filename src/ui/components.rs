@@ -1,7 +1,10 @@
 use dioxus::prelude::*;
 use reqwest::Client;
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
+use base64::Engine;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -20,6 +23,224 @@ use crate::rag::{index_directory, get_context};
 
 const MAX_HISTORY_MESSAGES: i64 = 10000;
 const MAX_TITLE_LEN: usize = 255;
+const ATTACHMENTS_PREFIX: &str = "<rustychat-attachments>";
+const ATTACHMENTS_SUFFIX: &str = "</rustychat-attachments>";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ChatAttachment {
+    path: String,
+    name: String,
+    kind: AttachmentKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AttachmentKind {
+    File,
+    Image,
+}
+
+fn make_attachment(path: &Path) -> ChatAttachment {
+    let path_str = path.to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path_str)
+        .to_string();
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let kind = if matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+    ) {
+        AttachmentKind::Image
+    } else {
+        AttachmentKind::File
+    };
+
+    ChatAttachment {
+        path: path_str,
+        name,
+        kind,
+    }
+}
+
+fn serialize_message_payload(text: &str, attachments: &[ChatAttachment]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+
+    let json = serde_json::to_string(attachments).unwrap_or_else(|_| "[]".to_string());
+    format!("{ATTACHMENTS_PREFIX}{json}{ATTACHMENTS_SUFFIX}\n{text}")
+}
+
+fn parse_message_payload(content: &str) -> (Vec<ChatAttachment>, String) {
+    if let Some(start) = content.find(ATTACHMENTS_PREFIX) {
+        let after_start = start + ATTACHMENTS_PREFIX.len();
+        if let Some(relative_end) = content[after_start..].find(ATTACHMENTS_SUFFIX) {
+            let end = after_start + relative_end;
+            let attachment_json = &content[after_start..end];
+            let attachments = serde_json::from_str::<Vec<ChatAttachment>>(attachment_json)
+                .unwrap_or_default();
+            let body = content[end + ATTACHMENTS_SUFFIX.len()..]
+                .strip_prefix('\n')
+                .unwrap_or(&content[end + ATTACHMENTS_SUFFIX.len()..])
+                .to_string();
+            return (attachments, body);
+        }
+    }
+
+    (Vec::new(), content.to_string())
+}
+
+fn is_prompt_text_file(path: &str) -> bool {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    matches!(
+        extension.as_str(),
+        "txt"
+            | "md"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "json"
+            | "toml"
+            | "c"
+            | "cpp"
+            | "h"
+            | "html"
+            | "css"
+            | "csv"
+            | "yaml"
+            | "yml"
+            | "xml"
+    )
+}
+
+fn attachment_image_src(path: &str) -> String {
+    let mime = match Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        _ => return format!("file:///{}", path.replace('\\', "/")),
+    };
+
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            format!("data:{mime};base64,{encoded}")
+        }
+        Err(_) => format!("file:///{}", path.replace('\\', "/")),
+    }
+}
+
+fn build_attachment_prompt(attachments: &[ChatAttachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+
+    const MAX_FILE_CHARS: usize = 12_000;
+    let mut sections = Vec::new();
+
+    for attachment in attachments {
+        match attachment.kind {
+            AttachmentKind::Image => {
+                sections.push(format!(
+                    "Attached image: {} ({})",
+                    attachment.name, attachment.path
+                ));
+            }
+            AttachmentKind::File => {
+                if is_prompt_text_file(&attachment.path) {
+                    match std::fs::read_to_string(&attachment.path) {
+                        Ok(mut content) => {
+                            if content.len() > MAX_FILE_CHARS {
+                                content.truncate(MAX_FILE_CHARS);
+                                content.push_str("\n[truncated]");
+                            }
+                            sections.push(format!(
+                                "Attached file: {} ({})\n```text\n{}\n```",
+                                attachment.name, attachment.path, content
+                            ));
+                        }
+                        Err(_) => {
+                            sections.push(format!(
+                                "Attached file: {} ({}) [could not read as text]",
+                                attachment.name, attachment.path
+                            ));
+                        }
+                    }
+                } else {
+                    sections.push(format!(
+                        "Attached file: {} ({}) [binary or unsupported preview type]",
+                        attachment.name, attachment.path
+                    ));
+                }
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("Attached items:\n{}", sections.join("\n\n"))
+    }
+}
+
+fn attachment_image_payload(path: &str) -> Option<String> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") {
+        return None;
+    }
+
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn build_attachment_images(attachments: &[ChatAttachment]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .filter_map(|attachment| attachment_image_payload(&attachment.path))
+        .collect()
+}
+
+fn render_message_for_model(content: &str) -> (String, Vec<String>) {
+    let (attachments, body) = parse_message_payload(content);
+    let attachment_context = build_attachment_prompt(&attachments);
+    let images = build_attachment_images(&attachments);
+
+    let text = match (body.trim().is_empty(), attachment_context.is_empty()) {
+        (false, true) => body,
+        (true, false) => attachment_context,
+        (false, false) => format!("{attachment_context}\n\nMessage:\n{body}"),
+        (true, true) => String::new(),
+    };
+
+    (text, images)
+}
 
 fn parse_mcp_tools_listing(listing: &str) -> Vec<(String, String)> {
     listing
@@ -647,6 +868,8 @@ pub fn ChatWindow(
     chats: Signal<Vec<(String, String)>>,
 ) -> Element {
     let mut input_text = use_signal(|| "".to_string());
+    let mut pending_attachments = use_signal(|| Vec::<ChatAttachment>::new());
+    let mut show_composer_tools = use_signal(|| false);
     let mut loading_chat = use_signal(|| Option::<String>::None);
     let mut current_cancel = use_signal(|| Option::<Arc<AtomicBool>>::None);
     let mut is_indexing = use_signal(|| false);
@@ -834,6 +1057,7 @@ pub fn ChatWindow(
         move |chat_id: String,
               history_snapshot: Vec<(String, String)>,
               user_message: String,
+              user_images: Vec<String>,
               cancel_flag: Arc<AtomicBool>| {
             async move {
                 let s = settings();
@@ -886,6 +1110,7 @@ pub fn ChatWindow(
                     ollama_messages.push(OllamaMessage {
                         role: "system".to_string(),
                         content: s.system_prompt.clone(),
+                        images: None,
                     });
                 }
 
@@ -906,19 +1131,26 @@ pub fn ChatWindow(
                     ollama_messages.push(OllamaMessage {
                         role: "system".to_string(),
                         content: mcp_note,
+                        images: None,
                     });
                 }
 
                 for (role, content) in history_snapshot.iter() {
+                    let (prompt_content, prompt_images) = render_message_for_model(content);
+                    if prompt_content.trim().is_empty() && prompt_images.is_empty() {
+                        continue;
+                    }
                     ollama_messages.push(OllamaMessage {
                         role: role.clone(),
-                        content: content.clone(),
+                        content: prompt_content,
+                        images: if prompt_images.is_empty() { None } else { Some(prompt_images) },
                     });
                 }
 
                 ollama_messages.push(OllamaMessage {
                     role: "user".to_string(),
                     content: enriched_message,
+                    images: if user_images.is_empty() { None } else { Some(user_images) },
                 });
 
                 let params_json = serde_json::json!({
@@ -1045,7 +1277,7 @@ pub fn ChatWindow(
     let has_model = !settings().model.trim().is_empty();
     let can_send = current_chat_id().is_some()
         && has_model
-        && !input_text().trim().is_empty()
+        && (!input_text().trim().is_empty() || !pending_attachments().is_empty())
         && !is_other_chat_loading;
     let composer_hint = if !has_model {
         Some("Select an Ollama model in Settings before sending messages.")
@@ -1084,14 +1316,16 @@ pub fn ChatWindow(
             rag_status,
             mcp_status,
             mcp_tools_cache,
-            mcp_last_error
+            mcp_last_error,
+            pending_attachments
         ];
         move || {
             if let Some(chat_id) = current_chat_id() {
                 let text = input_text();
                 let history_snapshot = messages();
+                let attachments = pending_attachments();
 
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && attachments.is_empty() {
                     return;
                 }
 
@@ -1102,17 +1336,22 @@ pub fn ChatWindow(
                 if user_text.len() > MAX_MESSAGE_LEN {
                     user_text.truncate(MAX_MESSAGE_LEN);
                 }
+                let stored_user_content = serialize_message_payload(&user_text, &attachments);
+                let attachment_context = build_attachment_prompt(&attachments);
+                let attachment_images = build_attachment_images(&attachments);
 
                 conn.execute(
                     "INSERT INTO messages (chat_id, role, content)
                      VALUES (?1, 'user', ?2)",
-                    params![chat_id, user_text.clone()],
+                    params![chat_id, stored_user_content.clone()],
                 ).unwrap();
 
                 enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
 
-                messages.push(("user".into(), user_text.clone()));
+                messages.push(("user".into(), stored_user_content.clone()));
                 input_text.set("".to_string());
+                pending_attachments.set(Vec::new());
+                show_composer_tools.set(false);
 
                 if !text.trim_start().starts_with("/mcp") {
                     if let Some(local_reply) = maybe_handle_mcp_meta_query(
@@ -1139,10 +1378,23 @@ pub fn ChatWindow(
                     let cancel_flag = Arc::new(AtomicBool::new(false));
                     current_cancel.set(Some(cancel_flag.clone()));
                     loading_chat.set(Some(chat_id.clone()));
+                    let final_user_prompt = if attachment_context.is_empty() {
+                        text
+                    } else if text.trim().is_empty() {
+                        attachment_context
+                    } else {
+                        format!("{attachment_context}\n\nUser Message:\n{text}")
+                    };
                     spawn({
                         let chat_id = chat_id.clone();
                         let cancel_flag = cancel_flag.clone();
-                        send_to_ollama(chat_id, history_snapshot, text, cancel_flag)
+                        send_to_ollama(
+                            chat_id,
+                            history_snapshot,
+                            final_user_prompt,
+                            attachment_images,
+                            cancel_flag,
+                        )
                     });
                 }
             }
@@ -1162,11 +1414,24 @@ pub fn ChatWindow(
                         p { class: "model-indicator secondary", "{corpus_display}" }
                     }
 
-                    if !settings().mcp_server_command.trim().is_empty() {
+                    div { class: "chat-header-actions",
+                        if !settings().mcp_server_command.trim().is_empty() {
+                            button {
+                                class: if show_mcp_workspace() { "header-workspace-btn active" } else { "header-workspace-btn" },
+                                onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
+                                if show_mcp_workspace() { "Hide MCP" } else { "Open MCP" }
+                            }
+                        }
                         button {
-                            class: if show_mcp_workspace() { "header-workspace-btn active" } else { "header-workspace-btn" },
-                            onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
-                            if show_mcp_workspace() { "Hide MCP" } else { "Open MCP" }
+                            class: "header-workspace-btn clear-index-header-btn",
+                            disabled: is_indexing(),
+                            onclick: move |_| {
+                                let conn = init_db();
+                                let cleared = clear_document_chunks(&conn);
+                                refresh_index_metrics();
+                                rag_status.set(Some(format!("Cleared {cleared} indexed document chunks.")));
+                            },
+                            "Clear Index"
                         }
                     }
                 }
@@ -1204,75 +1469,148 @@ pub fn ChatWindow(
             }
 
             div { class: "chat-input-area",
-                if !settings().mcp_server_command.trim().is_empty() {
+                div { class: "composer-tools-anchor",
                     button {
-                        class: if show_mcp_workspace() { "secondary-action-btn mcp-toggle-btn active" } else { "secondary-action-btn mcp-toggle-btn" },
-                        disabled: mcp_is_busy,
-                        onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
-                        if show_mcp_workspace() { "MCP Panel" } else { "MCP" }
+                        class: if show_composer_tools() { "composer-plus-btn active" } else { "composer-plus-btn" },
+                        disabled: is_current_chat_loading || is_indexing() || mcp_is_busy,
+                        onclick: move |_| show_composer_tools.set(!show_composer_tools()),
+                        if show_composer_tools() { "×" } else { "+" }
+                    }
+
+                    if show_composer_tools() {
+                        div { class: "composer-tools-popover",
+                            if !settings().mcp_server_command.trim().is_empty() {
+                                button {
+                                    class: if show_mcp_workspace() { "composer-tool-item active" } else { "composer-tool-item" },
+                                    disabled: mcp_is_busy,
+                                    onclick: move |_| {
+                                        show_mcp_workspace.set(!show_mcp_workspace());
+                                        show_composer_tools.set(false);
+                                    },
+                                    span { class: "composer-tool-icon", "⌘" }
+                                    span { class: "composer-tool-copy",
+                                        strong { if show_mcp_workspace() { "Hide MCP panel" } else { "Open MCP panel" } }
+                                        small { "Tools, file browsing, MCP actions" }
+                                    }
+                                }
+                            }
+
+                            button {
+                                class: "composer-tool-item",
+                                disabled: is_current_chat_loading,
+                                onclick: move |_| {
+                                    if let Some(paths) = FileDialog::new().pick_files() {
+                                        let mut next = pending_attachments();
+                                        for path in paths {
+                                            let attachment = make_attachment(&path);
+                                            if !next.iter().any(|existing| existing.path == attachment.path) {
+                                                next.push(attachment);
+                                            }
+                                        }
+                                        pending_attachments.set(next);
+                                    }
+                                    show_composer_tools.set(false);
+                                },
+                                span { class: "composer-tool-icon", "⤴" }
+                                span { class: "composer-tool-copy",
+                                    strong { "Attach files" }
+                                    small { "Share documents or images in chat" }
+                                }
+                            }
+
+                            button {
+                                class: "composer-tool-item",
+                                disabled: is_indexing(),
+                                onclick: move |_| {
+                                    if let Some(path) = FileDialog::new().pick_folder() {
+                                        let path_str = path.to_string_lossy().to_string();
+                                        let embed_model = settings().embed_model.clone();
+                                        if embed_model.trim().is_empty() {
+                                            rag_status.set(Some("Choose an embedding model in Settings before indexing a folder.".to_string()));
+                                            show_composer_tools.set(false);
+                                            return;
+                                        }
+                                        is_indexing.set(true);
+                                        rag_status.set(Some(format!("Indexing folder: {}", path_str)));
+                                        let mut indexed_files = indexed_files.clone();
+                                        let mut indexed_chunks = indexed_chunks.clone();
+                                        let mut rag_status = rag_status.clone();
+                                        let mut is_indexing = is_indexing.clone();
+                                        spawn(async move {
+                                            let status = match index_directory(&path_str, &embed_model).await {
+                                                Ok(stats) => {
+                                                    let conn = init_db();
+                                                    let total_files = count_indexed_files(&conn);
+                                                    let total_chunks = count_document_chunks(&conn);
+                                                    indexed_files.set(total_files);
+                                                    indexed_chunks.set(total_chunks);
+                                                    if stats.files_indexed == 0 || stats.chunks_indexed == 0 {
+                                                        format!(
+                                                            "No supported text files were indexed from {}. Supported types: .rs, .md, .txt, .py, .js, .ts, .toml, .json, .c, .cpp, .h",
+                                                            path_str
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "Indexed {} files and {} chunks from {} (replaced {} old chunks). Corpus now has {} files and {} chunks.",
+                                                            stats.files_indexed,
+                                                            stats.chunks_indexed,
+                                                            path_str,
+                                                            stats.chunks_replaced,
+                                                            total_files,
+                                                            total_chunks
+                                                        )
+                                                    }
+                                                }
+                                                Err(err) => format!("Indexing failed: {}", err),
+                                            };
+                                            is_indexing.set(false);
+                                            rag_status.set(Some(status));
+                                        });
+                                    }
+                                    show_composer_tools.set(false);
+                                },
+                                span { class: "composer-tool-icon", "◫" }
+                                span { class: "composer-tool-copy",
+                                    strong { if is_indexing() { "Indexing folder..." } else { "Index folder for RAG" } }
+                                    small { "Add a project or docs folder to local retrieval" }
+                                }
+                            }
+                        }
                     }
                 }
-                button {
-                    class: "send-button big", // reusing style
-                    disabled: is_indexing(),
-                    onclick: move |_| {
-                        if let Some(path) = FileDialog::new().pick_folder() {
-                            let path_str = path.to_string_lossy().to_string();
-                            let embed_model = settings().embed_model.clone();
-                            if embed_model.trim().is_empty() {
-                                rag_status.set(Some("Choose an embedding model in Settings before indexing a folder.".to_string()));
-                                return;
-                            }
-                            is_indexing.set(true);
-                            rag_status.set(Some(format!("Indexing folder: {}", path_str)));
-                            let mut indexed_files = indexed_files.clone();
-                            let mut indexed_chunks = indexed_chunks.clone();
-                            let mut rag_status = rag_status.clone();
-                            let mut is_indexing = is_indexing.clone();
-                            spawn(async move {
-                                let status = match index_directory(&path_str, &embed_model).await {
-                                    Ok(stats) => {
-                                        let conn = init_db();
-                                        let total_files = count_indexed_files(&conn);
-                                        let total_chunks = count_document_chunks(&conn);
-                                        indexed_files.set(total_files);
-                                        indexed_chunks.set(total_chunks);
-                                        if stats.files_indexed == 0 || stats.chunks_indexed == 0 {
-                                            format!(
-                                                "No supported text files were indexed from {}. Supported types: .rs, .md, .txt, .py, .js, .ts, .toml, .json, .c, .cpp, .h",
-                                                path_str
-                                            )
-                                        } else {
-                                            format!(
-                                                "Indexed {} files and {} chunks from {} (replaced {} old chunks). Corpus now has {} files and {} chunks.",
-                                                stats.files_indexed,
-                                                stats.chunks_indexed,
-                                                path_str,
-                                                stats.chunks_replaced,
-                                                total_files,
-                                                total_chunks
-                                            )
+                if !pending_attachments().is_empty() {
+                    div { class: "input-attachments-row",
+                        {pending_attachments().iter().enumerate().map(|(idx, attachment)| {
+                            let attachment_name = attachment.name.clone();
+                            let attachment_kind = attachment.kind.clone();
+                            let attachment_path = attachment.path.clone();
+                            rsx!(
+                                div { class: "input-attachment-chip",
+                                    if attachment_kind == AttachmentKind::Image {
+                                        img {
+                                            class: "input-attachment-preview",
+                                            src: "{attachment_image_src(&attachment_path)}",
+                                            alt: "{attachment_name}",
                                         }
+                                    } else {
+                                        div { class: "input-attachment-file", "FILE" }
                                     }
-                                    Err(err) => format!("Indexing failed: {}", err),
-                                };
-                                is_indexing.set(false);
-                                rag_status.set(Some(status));
-                            });
-                        }
-                    },
-                    if is_indexing() { "⏳" } else { "📁" }
-                }
-                button {
-                    class: "secondary-action-btn clear-index-btn",
-                    disabled: is_indexing(),
-                    onclick: move |_| {
-                        let conn = init_db();
-                        let cleared = clear_document_chunks(&conn);
-                        refresh_index_metrics();
-                        rag_status.set(Some(format!("Cleared {cleared} indexed document chunks.")));
-                    },
-                    "Clear Index"
+                                    div { class: "input-attachment-name", "{attachment_name}" }
+                                    button {
+                                        class: "input-attachment-remove",
+                                        onclick: move |_| {
+                                            let mut next = pending_attachments();
+                                            if idx < next.len() {
+                                                next.remove(idx);
+                                                pending_attachments.set(next);
+                                            }
+                                        },
+                                        "×"
+                                    }
+                                }
+                            )
+                        })}
+                    }
                 }
                 textarea {
                     class: "chat-input",
@@ -1293,29 +1631,21 @@ pub fn ChatWindow(
                     disabled: is_current_chat_loading,
                 }
 
-                { if is_current_chat_loading {
-                    rsx! {
-                        button {
-                            class: "interrupt-button big",
-                            onclick: move |_| {
-                                if let Some(cancel) = current_cancel() {
-                                    cancel.store(true, Ordering::Relaxed);
-                                }
-                                loading_chat.set(None);
-                                current_cancel.set(None);
-                            },
-                            "Interrupt"
-                        }
-                    }
-                } else {
-                    rsx!( Fragment {} )
-                }}
-
                 button {
-                    class: "send-button big",
-                    disabled: !can_send,
-                    onclick: move |_| submit_message(),
-                    "➤ Send"
+                    class: if is_current_chat_loading { "send-button big stop-mode" } else { "send-button big" },
+                    disabled: if is_current_chat_loading { false } else { !can_send },
+                    onclick: move |_| {
+                        if is_current_chat_loading {
+                            if let Some(cancel) = current_cancel() {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                            loading_chat.set(None);
+                            current_cancel.set(None);
+                        } else {
+                            submit_message();
+                        }
+                    },
+                    if is_current_chat_loading { "■" } else { "➤" }
                 }
             }
 
@@ -1474,22 +1804,26 @@ pub fn ChatWindow(
 
 #[component]
 pub fn Message(role: String, content: String) -> Element {
+    let (attachments, body_content) = parse_message_payload(&content);
     let class_name = if role == "user" {
         "message user-message"
     } else {
         "message assistant-message"
     };
 
-    if content.contains("<think>") && content.contains("</think>") {
-        let think_start = content.find("<think>").unwrap() + "<think>".len();
-        let think_end = content.find("</think>").unwrap();
-        let think_content = &content[think_start..think_end].trim();
+    if body_content.contains("<think>") && body_content.contains("</think>") {
+        let think_start = body_content.find("<think>").unwrap() + "<think>".len();
+        let think_end = body_content.find("</think>").unwrap();
+        let think_content = &body_content[think_start..think_end].trim();
 
-        let before_think = &content[..think_start - "<think>".len()];
-        let after_think = &content[think_end + "</think>".len()..];
+        let before_think = &body_content[..think_start - "<think>".len()];
+        let after_think = &body_content[think_end + "</think>".len()..];
 
         rsx! {
             div { class: "{class_name}",
+                if !attachments.is_empty() {
+                    AttachmentGallery { attachments: attachments.clone() }
+                }
                 {if !before_think.is_empty() {
                     rsx! { Markdown { content: before_think.to_string() } }
                 } else {
@@ -1515,8 +1849,43 @@ pub fn Message(role: String, content: String) -> Element {
     } else {
         rsx! {
             div { class: "{class_name}",
-                Markdown { content: content.clone() }
+                if !attachments.is_empty() {
+                    AttachmentGallery { attachments: attachments.clone() }
+                }
+                if !body_content.trim().is_empty() {
+                    Markdown { content: body_content.clone() }
+                }
             }
+        }
+    }
+}
+
+#[component]
+fn AttachmentGallery(attachments: Vec<ChatAttachment>) -> Element {
+    rsx! {
+        div { class: "message-attachments",
+            {attachments.iter().map(|attachment| {
+                let name = attachment.name.clone();
+                let path = attachment.path.clone();
+                let kind = attachment.kind.clone();
+                rsx!(
+                    div { class: "message-attachment-card",
+                        if kind == AttachmentKind::Image {
+                            img {
+                                class: "message-attachment-image",
+                                src: "{attachment_image_src(&path)}",
+                                alt: "{name}",
+                            }
+                        } else {
+                            div { class: "message-attachment-file-badge", "FILE" }
+                        }
+                        div { class: "message-attachment-copy",
+                            div { class: "message-attachment-name", "{name}" }
+                            div { class: "message-attachment-path", "{path}" }
+                        }
+                    }
+                )
+            })}
         }
     }
 }

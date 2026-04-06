@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct OllamaMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
