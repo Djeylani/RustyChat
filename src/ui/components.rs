@@ -13,6 +13,7 @@ use crate::db::{
     clear_document_chunks, count_document_chunks, count_indexed_files, enforce_history_limit,
     init_db, save_settings, Settings, clamp_to_i32,
 };
+use crate::mcp::handle_mcp_command;
 use crate::ollama::{OllamaChatRequest, OllamaChatResponse, OllamaMessage};
 use crate::ui::Markdown;
 use crate::rag::{index_directory, get_context};
@@ -33,6 +34,7 @@ pub fn SettingsModal(
     // local editable copies using signals
     let mut local_model = use_signal(|| settings().model.clone());
     let mut local_embed_model = use_signal(|| settings().embed_model.clone());
+    let mut local_mcp_server_command = use_signal(|| settings().mcp_server_command.clone());
     let mut local_system = use_signal(|| settings().system_prompt.clone());
     let mut local_temp = use_signal(|| settings().temperature);
     let mut local_top_p = use_signal(|| settings().top_p);
@@ -92,6 +94,7 @@ pub fn SettingsModal(
         let settings_sig = settings.clone();
         let mut local_model_sig = local_model.clone();
         let mut local_embed_model_sig = local_embed_model.clone();
+        let mut local_mcp_server_command_sig = local_mcp_server_command.clone();
         let mut local_system_sig = local_system.clone();
         let mut local_temp_sig = local_temp.clone();
         let mut local_top_p_sig = local_top_p.clone();
@@ -104,6 +107,7 @@ pub fn SettingsModal(
                 let s = settings_sig();
                 local_model_sig.set(s.model.clone());
                 local_embed_model_sig.set(s.embed_model.clone());
+                local_mcp_server_command_sig.set(s.mcp_server_command.clone());
                 local_system_sig.set(s.system_prompt.clone());
                 local_temp_sig.set(s.temperature);
                 local_top_p_sig.set(s.top_p);
@@ -129,6 +133,7 @@ pub fn SettingsModal(
         to_owned![
             local_model,
             local_embed_model,
+            local_mcp_server_command,
             local_system,
             local_temp,
             local_top_p,
@@ -144,10 +149,12 @@ pub fn SettingsModal(
             model_str = model_str.trim().to_string();
             let mut embed_model_str = local_embed_model().clone();
             embed_model_str = embed_model_str.trim().to_string();
+            let mcp_server_command_str = local_mcp_server_command().trim().to_string();
 
             let new_settings = Settings {
                 model: model_str,
                 embed_model: embed_model_str,
+                mcp_server_command: mcp_server_command_str,
                 system_prompt: local_system().clone(),
                 temperature: local_temp(),
                 top_p: local_top_p(),
@@ -215,6 +222,15 @@ pub fn SettingsModal(
                 if local_embed_model().is_empty() {
                     p { class: "dim-text warning-text", "No embedding model selected - chat will still work, but RAG indexing and retrieval stay disabled." }
                 }
+
+                label { "MCP server command (optional)" }
+                input {
+                    class: "input",
+                    value: "{local_mcp_server_command}",
+                    placeholder: "Folder path, MCP HTTP URL, or full MCP server command",
+                    oninput: move |e| local_mcp_server_command.set(e.value()),
+                }
+                p { class: "dim-text warning-text", "You can paste a folder path for the filesystem MCP server, an MCP HTTP endpoint URL, or a full stdio MCP command. Then use `/mcp tools` or `/mcp call <tool> {{json}}` in chat." }
 
                 label { "System prompt (optional)" }
                 textarea {
@@ -519,6 +535,9 @@ pub fn ChatWindow(
     let mut current_cancel = use_signal(|| Option::<Arc<AtomicBool>>::None);
     let mut is_indexing = use_signal(|| false);
     let mut rag_status = use_signal(|| Option::<String>::None);
+    let mcp_status = use_signal(|| Option::<String>::None);
+    let mcp_tools_cache = use_signal(|| Option::<String>::None);
+    let mcp_last_error = use_signal(|| Option::<String>::None);
     let indexed_chunks = use_signal(|| count_document_chunks(&init_db()));
     let indexed_files = use_signal(|| count_indexed_files(&init_db()));
     let http_client = use_signal(|| Client::new());
@@ -570,6 +589,13 @@ pub fn ChatWindow(
             m
         }
     };
+    let mcp_display = if settings().mcp_server_command.trim().is_empty() {
+        "MCP: not configured".to_string()
+    } else if let Some(status) = mcp_status() {
+        format!("MCP: {status}")
+    } else {
+        "MCP: ready".to_string()
+    };
     let corpus_display = format!(
         "Indexed corpus: {} files, {} chunks",
         indexed_files(),
@@ -593,7 +619,10 @@ pub fn ChatWindow(
             current_cancel,
             current_chat_id,
             settings,
-            rag_status
+            rag_status,
+            mcp_status,
+            mcp_tools_cache,
+            mcp_last_error
         ];
         move |chat_id: String,
               history_snapshot: Vec<(String, String)>,
@@ -650,6 +679,26 @@ pub fn ChatWindow(
                     ollama_messages.push(OllamaMessage {
                         role: "system".to_string(),
                         content: s.system_prompt.clone(),
+                    });
+                }
+
+                if !s.mcp_server_command.trim().is_empty() {
+                    let mut mcp_note = format!(
+                        "MCP session state: {}.",
+                        mcp_status().unwrap_or_else(|| "unknown".to_string())
+                    );
+                    if let Some(last_error) = mcp_last_error() {
+                        mcp_note.push_str(&format!("\nLast MCP error: {last_error}"));
+                    }
+                    if let Some(tools) = mcp_tools_cache() {
+                        mcp_note.push_str(&format!("\nLast MCP tools listing:\n{tools}"));
+                    }
+                    mcp_note.push_str(
+                        "\nUse this note to answer MCP availability or tool-list questions accurately in normal chat. Tool execution itself still requires explicit /mcp commands."
+                    );
+                    ollama_messages.push(OllamaMessage {
+                        role: "system".to_string(),
+                        content: mcp_note,
                     });
                 }
 
@@ -805,7 +854,12 @@ pub fn ChatWindow(
             messages,
             current_cancel,
             loading_chat,
-            send_to_ollama
+            send_to_ollama,
+            settings,
+            rag_status,
+            mcp_status,
+            mcp_tools_cache,
+            mcp_last_error
         ];
         move || {
             if let Some(chat_id) = current_chat_id() {
@@ -835,15 +889,80 @@ pub fn ChatWindow(
                 messages.push(("user".into(), user_text.clone()));
                 input_text.set("".to_string());
 
-                let cancel_flag = Arc::new(AtomicBool::new(false));
-                current_cancel.set(Some(cancel_flag.clone()));
-                loading_chat.set(Some(chat_id.clone()));
+                if !text.trim_start().starts_with("/mcp") {
+                    if let Some(local_reply) = maybe_handle_mcp_meta_query(
+                        &text,
+                        &settings().mcp_server_command,
+                        mcp_status(),
+                        mcp_tools_cache(),
+                        mcp_last_error(),
+                    ) {
+                        let _ = conn.execute(
+                            "INSERT INTO messages (chat_id, role, content)
+                             VALUES (?1, 'assistant', ?2)",
+                            params![chat_id, local_reply],
+                        );
+                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
+                        messages.push(("assistant".into(), local_reply));
+                        return;
+                    }
+                }
 
-                spawn({
-                    let chat_id = chat_id.clone();
-                    let cancel_flag = cancel_flag.clone();
-                    send_to_ollama(chat_id, history_snapshot, text, cancel_flag)
-                });
+                if text.trim_start().starts_with("/mcp") {
+                    let mcp_command = settings().mcp_server_command.clone();
+                    let mut rag_status = rag_status.clone();
+                    let mut mcp_status = mcp_status.clone();
+                    let mut mcp_tools_cache = mcp_tools_cache.clone();
+                    let mut mcp_last_error = mcp_last_error.clone();
+                    mcp_status.set(Some("starting server".to_string()));
+                    mcp_last_error.set(None);
+                    rag_status.set(Some("MCP: starting server...".to_string()));
+                    spawn(async move {
+                        mcp_status.set(Some("running command".to_string()));
+                        rag_status.set(Some("MCP: running command...".to_string()));
+                        let result = handle_mcp_command(&mcp_command, &text).await;
+                        let conn = init_db();
+                        let assistant_text = match result {
+                            Ok(output) => {
+                                mcp_status.set(Some("ready".to_string()));
+                                mcp_last_error.set(None);
+                                if text.trim() == "/mcp tools" || text.trim() == "/mcp tools/list" {
+                                    mcp_tools_cache.set(Some(output.clone()));
+                                }
+                                rag_status.set(Some("MCP command completed.".to_string()));
+                                output
+                            }
+                            Err(err) => {
+                                mcp_status.set(Some("error".to_string()));
+                                mcp_last_error.set(Some(err.clone()));
+                                rag_status.set(Some(format!("MCP command failed: {err}")));
+                                format!("MCP Error: {err}")
+                            }
+                        };
+                        let _ = conn.execute(
+                            "INSERT INTO messages (chat_id, role, content)
+                             VALUES (?1, 'assistant', ?2)",
+                            params![chat_id, assistant_text],
+                        );
+                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
+                        if current_chat_id()
+                            .as_ref()
+                            .map(|c| c == &chat_id)
+                            .unwrap_or(false)
+                        {
+                            messages.push(("assistant".into(), assistant_text));
+                        }
+                    });
+                } else {
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    current_cancel.set(Some(cancel_flag.clone()));
+                    loading_chat.set(Some(chat_id.clone()));
+                    spawn({
+                        let chat_id = chat_id.clone();
+                        let cancel_flag = cancel_flag.clone();
+                        send_to_ollama(chat_id, history_snapshot, text, cancel_flag)
+                    });
+                }
             }
         }
     };
@@ -855,6 +974,7 @@ pub fn ChatWindow(
                 h2 { "{header_title}" }
                 p { class: "model-indicator", "Model: {model_display}" }
                 p { class: "model-indicator secondary", "Embeddings: {embed_model_display}" }
+                p { class: "model-indicator secondary", "{mcp_display}" }
                 p { class: "model-indicator secondary", "{corpus_display}" }
             }
 
@@ -1046,4 +1166,83 @@ pub fn Message(role: String, content: String) -> Element {
             }
         }
     }
+}
+
+fn maybe_handle_mcp_meta_query(
+    user_text: &str,
+    mcp_server_command: &str,
+    mcp_status: Option<String>,
+    mcp_tools_cache: Option<String>,
+    mcp_last_error: Option<String>,
+) -> Option<String> {
+    let lower = user_text.trim().to_lowercase();
+    let normalized = lower
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>();
+    let contains_phrase = |phrase: &str| normalized.contains(phrase);
+
+    let asks_tools = contains_phrase("what mcp tools")
+        || contains_phrase("which mcp tools")
+        || contains_phrase("list mcp tools")
+        || contains_phrase("show mcp tools")
+        || contains_phrase("what tools are available")
+        || contains_phrase("which tools are available")
+        || contains_phrase("available mcp tools");
+    let asks_status = contains_phrase("is the mcp server running")
+        || contains_phrase("is mcp running")
+        || contains_phrase("is the mcp server working")
+        || contains_phrase("is mcp working")
+        || contains_phrase("mcp server status")
+        || contains_phrase("mcp status")
+        || contains_phrase("is mcp connected")
+        || contains_phrase("is the mcp server connected");
+
+    if !asks_tools && !asks_status {
+        return None;
+    }
+
+    if asks_tools {
+        return Some(match mcp_tools_cache {
+            Some(tools) => format!("The last MCP tools listing for this session was:\n\n{tools}"),
+            None => {
+                if mcp_server_command.trim().is_empty() {
+                    "No MCP server is configured yet, so there is no tool list available.".to_string()
+                } else {
+                    "I don't have a cached MCP tool list yet in this session. Run `/mcp tools` first, then I can answer normal questions about the available MCP tools.".to_string()
+                }
+            }
+        });
+    }
+
+    if asks_status {
+        return Some(match mcp_status.as_deref() {
+            Some("ready") => {
+                let mut msg = "Yes. Based on this session state, the MCP server is running and responded successfully the last time it was used.".to_string();
+                if let Some(tools) = mcp_tools_cache {
+                    msg.push_str(&format!("\n\nCached MCP tools:\n{tools}"));
+                }
+                msg
+            }
+            Some("starting server") | Some("running command") => {
+                "The MCP server is still in progress right now. The current session state shows that it is starting or running a command.".to_string()
+            }
+            Some("error") => {
+                if let Some(err) = mcp_last_error {
+                    format!("No. The latest MCP attempt failed with this error:\n\n{err}")
+                } else {
+                    "No. The latest MCP attempt failed, but there is no cached error text.".to_string()
+                }
+            }
+            _ => {
+                if mcp_server_command.trim().is_empty() {
+                    "No MCP server is configured yet in Settings.".to_string()
+                } else {
+                    "I don't have a confirmed MCP status yet for this session. Run `/mcp tools` once, then I can answer normal MCP status questions from the cached result.".to_string()
+                }
+            }
+        });
+    }
+
+    None
 }

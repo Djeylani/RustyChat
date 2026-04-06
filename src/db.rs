@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, Row};
 pub struct Settings {
     pub model: String,
     pub embed_model: String,
+    pub mcp_server_command: String,
     pub system_prompt: String,
     pub temperature: f64,
     pub top_p: f64,
@@ -45,6 +46,7 @@ pub fn init_db() -> Connection {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             model TEXT NOT NULL,
             embed_model TEXT NOT NULL DEFAULT '',
+            mcp_server_command TEXT NOT NULL DEFAULT '',
             system_prompt TEXT,
             temperature REAL,
             top_p REAL,
@@ -60,6 +62,10 @@ pub fn init_db() -> Connection {
 
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN embed_model TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN mcp_server_command TEXT NOT NULL DEFAULT ''",
         [],
     );
 
@@ -82,10 +88,11 @@ pub fn init_db() -> Connection {
 
     if !exists {
         conn.execute(
-            "INSERT INTO settings (id, model, embed_model, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO settings (id, model, embed_model, mcp_server_command, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 "", // no default model — user must pick one
+                "",
                 "",
                 "",
                 0.7_f64,
@@ -116,21 +123,22 @@ pub fn clamp_to_i32(v: i64) -> i32 {
 
 pub fn load_settings(conn: &Connection) -> Settings {
     conn.query_row(
-        "SELECT model, embed_model, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height FROM settings WHERE id = 1",
+        "SELECT model, embed_model, mcp_server_command, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height FROM settings WHERE id = 1",
         [],
         |row: &Row| {
             Ok(Settings {
                 model: row.get::<_, String>(0)?,
                 embed_model: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                system_prompt: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                temperature: row.get::<_, Option<f64>>(3)?.unwrap_or(0.7),
-                top_p: row.get::<_, Option<f64>>(4)?.unwrap_or(0.95),
-                max_tokens: clamp_to_i32(row.get::<_, Option<i64>>(5)?.unwrap_or(512)),
-                zoom: clamp_to_i32(row.get::<_, Option<i64>>(6)?.unwrap_or(100)),
+                mcp_server_command: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                system_prompt: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                temperature: row.get::<_, Option<f64>>(4)?.unwrap_or(0.7),
+                top_p: row.get::<_, Option<f64>>(5)?.unwrap_or(0.95),
+                max_tokens: clamp_to_i32(row.get::<_, Option<i64>>(6)?.unwrap_or(512)),
+                zoom: clamp_to_i32(row.get::<_, Option<i64>>(7)?.unwrap_or(100)),
                 // always treat maximized as true on start (we still read DB value for compatibility)
                 maximized: true,
-                window_width: clamp_to_i32(row.get::<_, Option<i64>>(8)?.unwrap_or(1024)),
-                window_height: clamp_to_i32(row.get::<_, Option<i64>>(9)?.unwrap_or(768)),
+                window_width: clamp_to_i32(row.get::<_, Option<i64>>(9)?.unwrap_or(1024)),
+                window_height: clamp_to_i32(row.get::<_, Option<i64>>(10)?.unwrap_or(768)),
             })
         },
     )
@@ -145,10 +153,11 @@ pub fn save_settings(conn: &Connection, s: &Settings) {
     let height: i64 = s.window_height.into();
 
     conn.execute(
-        "UPDATE settings SET model = ?1, embed_model = ?2, system_prompt = ?3, temperature = ?4, top_p = ?5, max_tokens = ?6, zoom = ?7, maximized = ?8, window_width = ?9, window_height = ?10 WHERE id = 1",
+        "UPDATE settings SET model = ?1, embed_model = ?2, mcp_server_command = ?3, system_prompt = ?4, temperature = ?5, top_p = ?6, max_tokens = ?7, zoom = ?8, maximized = ?9, window_width = ?10, window_height = ?11 WHERE id = 1",
         params![
             s.model,
             s.embed_model,
+            s.mcp_server_command,
             s.system_prompt,
             s.temperature,
             s.top_p,

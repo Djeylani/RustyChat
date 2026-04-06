@@ -12,6 +12,7 @@ mod ollama;
 mod ui;
 mod rag;
 mod executor;
+mod mcp;
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 

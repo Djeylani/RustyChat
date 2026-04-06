@@ -22,7 +22,7 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
 ## Phase 3: Agentic Execution (The "Power") ✅
 - [x] **Inline Script Runner:** Execute Python/Bash/JS blocks directly.
 - [x] **Output Console:** Capture and display `stdout`/`stderr` in a drawer.
-- [ ] **MCP Client:** Basic Model Context Protocol support for external tools.
+- [x] **MCP Client:** Basic Model Context Protocol support for external tools.
 
 ## Phase 4: Architectural Integrity (The "Foundation") ✅
 - [x] **Modularization:** Split `main.rs` into `db`, `ui`, `ollama`, and `rag`.
@@ -30,4 +30,4 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
 - [ ] **State Management:** Optimize Dioxus signals for large conversation histories.
 
 ---
-*Status: ⚡ Agentic Execution (Phase 3)*
+*Status: ⚙️ Phase 3 complete. Phase 4 remaining.*
