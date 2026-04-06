@@ -594,7 +594,52 @@ main {
     font-weight: 700;
 }
 
-/* Settings Modal Overhaul */
+/* Execution Console */
+.execution-console {
+    background: #080808;
+    border-top: 1px solid var(--border-glass);
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+}
+
+.console-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.console-close {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+}
+
+.console-stdout {
+    color: #d1d5db;
+    white-space: pre-wrap;
+    margin: 0 0 8px 0;
+}
+
+.console-stderr {
+    color: var(--danger);
+    white-space: pre-wrap;
+    margin: 0 0 8px 0;
+}
+
+.console-footer {
+    border-top: 1px solid rgba(255, 255, 255, 0.03);
+    padding-top: 8px;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+}
+
+/* Custom Scrollbar */
 .settings-overlay {
     position: fixed;
     inset: 0;

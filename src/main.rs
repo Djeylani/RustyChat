@@ -11,6 +11,7 @@ mod db;
 mod ollama;
 mod ui;
 mod rag;
+mod executor;
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 

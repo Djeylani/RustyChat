@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use pulldown_cmark::{Event, Parser, TagEnd, CodeBlockKind};
 use arboard::Clipboard;
+use crate::executor::{execute_code, ExecutionResult};
 
 #[component]
 pub fn Markdown(content: String) -> Element {
@@ -10,6 +11,8 @@ pub fn Markdown(content: String) -> Element {
 #[component]
 fn CodeBlock(language: String, content: String) -> Element {
     let mut copied = use_signal(|| false);
+    let mut execution_result = use_signal(|| Option::<ExecutionResult>::None);
+    let mut is_executing = use_signal(|| false);
 
     let copy_to_clipboard = {
         to_owned![content];
@@ -17,7 +20,6 @@ fn CodeBlock(language: String, content: String) -> Element {
             if let Ok(mut clipboard) = Clipboard::new() {
                 if clipboard.set_text(content.clone()).is_ok() {
                     copied.set(true);
-                    // Reset after 2 seconds
                     spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         copied.set(false);
@@ -30,8 +32,15 @@ fn CodeBlock(language: String, content: String) -> Element {
     let run_code = {
         to_owned![content, language];
         move |_| {
-            // Placeholder for Phase 3: Inline Script Runner
-            println!("Run clicked for {}: \n{}", language, content);
+            is_executing.set(true);
+            execution_result.set(None);
+            let content = content.clone();
+            let language = language.clone();
+            spawn(async move {
+                let result = execute_code(&language, &content).await;
+                execution_result.set(Some(result));
+                is_executing.set(false);
+            });
         }
     };
 
@@ -47,14 +56,41 @@ fn CodeBlock(language: String, content: String) -> Element {
                     }
                     button { 
                         class: "code-action-btn run-btn", 
+                        disabled: is_executing(),
                         onclick: run_code,
-                        "▶ Run"
+                        if is_executing() { "⌛ Running..." } else { "▶ Run" }
                     }
                 }
             }
             pre { class: "code-block",
                 code { "{content}" }
             }
+            
+            {if let Some(result) = execution_result() {
+                rsx! {
+                    div { class: "execution-console",
+                        div { class: "console-header", 
+                            span { "Console Output" }
+                            button { 
+                                class: "console-close",
+                                onclick: move |_| execution_result.set(None),
+                                "✕"
+                            }
+                        }
+                        if !result.stdout.is_empty() {
+                            pre { class: "console-stdout", "{result.stdout}" }
+                        }
+                        if !result.stderr.is_empty() {
+                            pre { class: "console-stderr", "{result.stderr}" }
+                        }
+                        div { class: "console-footer",
+                            span { "Exit Code: {result.exit_code.unwrap_or(0)}" }
+                        }
+                    }
+                }
+            } else {
+                rsx! { Fragment {} }
+            }}
         }
     }
 }
@@ -63,7 +99,6 @@ fn render_markdown(content: &str) -> Element {
     let parser = Parser::new(content);
     let mut stack: Vec<Vec<Element>> = vec![Vec::new()];
     
-    // To extract raw code content, we need to track if we are inside a code block
     let mut current_code_lang = String::new();
     let mut current_code_content = String::new();
     let mut in_code_block = false;
@@ -81,7 +116,7 @@ fn render_markdown(content: &str) -> Element {
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
-                stack.pop(); // discard the children since we want raw text
+                stack.pop();
                 let parent_buffer = stack.last_mut().expect("Stack underflow");
                 
                 parent_buffer.push(rsx!(

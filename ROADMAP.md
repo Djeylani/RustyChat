@@ -19,9 +19,9 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
     - [x] Vector storage in SQLite.
 - [x] **Context Injection:** Automatic retrieval of relevant chunks before prompting.
 
-## Phase 3: Agentic Execution (The "Power")
-- [ ] **Inline Script Runner:** Execute Python/Bash/JS blocks directly.
-- [ ] **Output Console:** Capture and display `stdout`/`stderr` in a drawer.
+## Phase 3: Agentic Execution (The "Power") ✅
+- [x] **Inline Script Runner:** Execute Python/Bash/JS blocks directly.
+- [x] **Output Console:** Capture and display `stdout`/`stderr` in a drawer.
 - [ ] **MCP Client:** Basic Model Context Protocol support for external tools.
 
 ## Phase 4: Architectural Integrity (The "Foundation") ✅
