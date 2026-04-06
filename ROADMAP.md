@@ -28,6 +28,13 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
 - [x] **Modularization:** Split `main.rs` into `db`, `ui`, `ollama`, and `rag`.
 - [ ] **Error Handling:** Centralized error logging and user notifications.
 - [ ] **State Management:** Optimize Dioxus signals for large conversation histories.
+- [ ] **File & Folder Sharing:** Let users attach files and folders directly into chat flows, not only RAG indexing.
+- [ ] **Image Sharing:** Support image attachment/upload in chat and render image messages cleanly.
+- [ ] **Multimodal Pipeline:** Pass attached images/files to models or tool flows that can actually consume them.
+- [ ] **MCP Integrations UX:** Support multiple MCP integrations with structured config, auth/env fields, and validation.
+- [ ] **Tool-Friendly Results:** Add richer result views for common MCP/file operations instead of raw text-first outputs.
+- [ ] **Execution Safety:** Add sandboxing or a safer execution boundary for the inline code runner.
+- [ ] **Long-History Performance:** Add virtualization or equivalent rendering strategy for very large chats.
 
 ---
-*Status: ⚙️ Phase 3 complete. Phase 4 remaining.*
+*Status: ⚙️ Phases 1-3 complete. Phase 4 focuses on product hardening, richer attachments, safer execution, and scalability.*
