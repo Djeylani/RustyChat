@@ -258,7 +258,7 @@ async fn handle_http_command(server_url: &str, request: ParsedMcpCommand) -> Res
                 session_id.as_deref(),
             )
             .await?;
-            format_call_response(&response.0)
+            format_call_response(&name, &response.0)
         }
     }
 }
@@ -340,7 +340,7 @@ async fn tools_call(
     .await?;
 
     let response = read_response(stdout, 3).await?;
-    format_call_response(&response)
+    format_call_response(name, &response)
 }
 
 fn format_tools_response(response: &Value) -> Result<String, String> {
@@ -372,7 +372,7 @@ fn format_tools_response(response: &Value) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn format_call_response(response: &Value) -> Result<String, String> {
+fn format_call_response(tool_name: &str, response: &Value) -> Result<String, String> {
     if let Some(error) = response.get("error") {
         return Err(format!(
             "tools/call failed: {}",
@@ -389,11 +389,9 @@ fn format_call_response(response: &Value) -> Result<String, String> {
             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                 let trimmed = text.trim();
                 if let Ok(json_value) = serde_json::from_str::<Value>(trimmed) {
-                    let pretty = serde_json::to_string_pretty(&json_value)
-                        .map_err(|e| format!("Failed to format MCP JSON content: {e}"))?;
-                    sections.push(format!("```json\n{pretty}\n```"));
+                    sections.push(format_tool_json_payload(tool_name, &json_value));
                 } else {
-                    sections.push(trimmed.to_string());
+                    sections.push(format_tool_text_payload(tool_name, trimmed));
                 }
             } else {
                 let pretty = serde_json::to_string_pretty(item)
@@ -420,6 +418,112 @@ fn format_call_response(response: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(result)
         .map(|pretty| format!("```json\n{pretty}\n```"))
         .map_err(|e| format!("Failed to format MCP tool result: {e}"))
+}
+
+fn format_tool_text_payload(tool_name: &str, text: &str) -> String {
+    match tool_name {
+        "list_directory" | "list_directory_with_sizes" => format_directory_listing(text),
+        "read_text_file" | "read_file" => format!("```text\n{}\n```", text),
+        _ => text.to_string(),
+    }
+}
+
+fn format_tool_json_payload(tool_name: &str, value: &Value) -> String {
+    match tool_name {
+        "directory_tree" => format_directory_tree(value).unwrap_or_else(|| fenced_json(value)),
+        "list_allowed_directories" | "search_files" => {
+            format_string_list(value).unwrap_or_else(|| fenced_json(value))
+        }
+        "get_file_info" => format_file_info(value).unwrap_or_else(|| fenced_json(value)),
+        _ => fenced_json(value),
+    }
+}
+
+fn fenced_json(value: &Value) -> String {
+    match serde_json::to_string_pretty(value) {
+        Ok(pretty) => format!("```json\n{pretty}\n```"),
+        Err(_) => "```json\n{}\n```".to_string(),
+    }
+}
+
+fn format_string_list(value: &Value) -> Option<String> {
+    let items = value.as_array()?;
+    let entries: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.as_str().map(|s| format!("- `{s}`")))
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join("\n"))
+    }
+}
+
+fn format_directory_listing(text: &str) -> String {
+    let mut lines = Vec::new();
+    for raw in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(rest) = raw.strip_prefix("[DIR]") {
+            lines.push(format!("- `DIR` {}", rest.trim()));
+        } else if let Some(rest) = raw.strip_prefix("[FILE]") {
+            lines.push(format!("- `FILE` {}", rest.trim()));
+        } else {
+            lines.push(format!("- {}", raw));
+        }
+    }
+
+    if lines.is_empty() {
+        text.to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn format_directory_tree(value: &Value) -> Option<String> {
+    fn push_node(lines: &mut Vec<String>, node: &Value, depth: usize) {
+        let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let node_type = node.get("type").and_then(|v| v.as_str()).unwrap_or("file");
+        let indent = "  ".repeat(depth);
+        let label = if node_type == "directory" { "DIR" } else { "FILE" };
+        lines.push(format!("{indent}- `{label}` {name}"));
+
+        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+            for child in children {
+                push_node(lines, child, depth + 1);
+            }
+        }
+    }
+
+    let nodes = value.as_array()?;
+    let mut lines = Vec::new();
+    for node in nodes {
+        push_node(&mut lines, node, 0);
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn format_file_info(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+    let mut lines = Vec::new();
+    for key in ["path", "type", "size", "created", "modified", "permissions"] {
+        if let Some(entry) = map.get(key) {
+            let rendered = entry
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| entry.to_string());
+            lines.push(format!("- **{}**: {}", key, rendered));
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 async fn send_http_message(

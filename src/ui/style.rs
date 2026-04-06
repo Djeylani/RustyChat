@@ -337,6 +337,13 @@ main {
     z-index: 20;
 }
 
+.chat-header-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
 .chat-header h2 {
     margin: 0;
     font-size: 0.95rem;
@@ -356,6 +363,29 @@ main {
     color: var(--text-dim);
 }
 
+.header-workspace-btn {
+    min-width: 108px;
+    height: 40px;
+    border-radius: 999px;
+    border: 1px solid rgba(59, 130, 246, 0.22);
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(15, 23, 42, 0.55));
+    color: var(--text-pure);
+    cursor: pointer;
+    padding: 0 18px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    box-shadow: 0 12px 28px rgba(59, 130, 246, 0.16);
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.header-workspace-btn:hover,
+.header-workspace-btn.active {
+    transform: translateY(-1px);
+    border-color: rgba(96, 165, 250, 0.42);
+    box-shadow: 0 16px 34px rgba(59, 130, 246, 0.22);
+}
+
 .chat-messages {
     flex: 1;
     overflow-y: auto;
@@ -366,6 +396,274 @@ main {
     min-height: 0;
     min-width: 0;
     overscroll-behavior: contain;
+}
+
+.mcp-workspace-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(1, 4, 9, 0.52);
+    backdrop-filter: blur(8px);
+    z-index: 35;
+}
+
+.mcp-workspace-drawer {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    bottom: 18px;
+    width: min(420px, calc(100% - 36px));
+    z-index: 40;
+    animation: drawerIn 0.24s cubic-bezier(0.2, 0.9, 0.2, 1);
+}
+
+@keyframes drawerIn {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.mcp-workspace-shell {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 22px;
+    border-radius: 28px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background:
+        radial-gradient(circle at top right, rgba(59, 130, 246, 0.18), transparent 34%),
+        radial-gradient(circle at top left, rgba(148, 163, 184, 0.08), transparent 26%),
+        linear-gradient(180deg, rgba(11, 15, 24, 0.96), rgba(8, 10, 17, 0.98));
+    box-shadow: 0 26px 80px rgba(0, 0, 0, 0.55);
+    overflow-y: auto;
+}
+
+.mcp-workspace-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.mcp-workspace-kicker {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.12);
+    border: 1px solid rgba(59, 130, 246, 0.2);
+    color: #93c5fd;
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 12px;
+}
+
+.mcp-workspace-header h3 {
+    margin: 0 0 6px 0;
+    font-size: 1.4rem;
+    line-height: 1.2;
+    color: var(--text-pure);
+}
+
+.mcp-workspace-header p {
+    margin: 0;
+    color: rgba(255, 255, 255, 0.66);
+    font-size: 0.88rem;
+    line-height: 1.55;
+}
+
+.mcp-close-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-soft);
+    cursor: pointer;
+    font-size: 1.2rem;
+    line-height: 1;
+    transition: all 0.16s ease;
+}
+
+.mcp-close-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-pure);
+}
+
+.mcp-status-card,
+.mcp-tool-description-card,
+.mcp-empty-state-card {
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 20px;
+    background: rgba(255, 255, 255, 0.03);
+    padding: 16px;
+}
+
+.mcp-status-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 30px;
+    padding: 0 12px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.14);
+    color: #bfdbfe;
+    border: 1px solid rgba(59, 130, 246, 0.24);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.mcp-status-copy {
+    margin: 12px 0 0 0;
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 0.84rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+}
+
+.mcp-status-copy.error {
+    color: #fca5a5;
+}
+
+.mcp-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.mcp-primary-btn {
+    min-height: 44px;
+    border-radius: 16px;
+    border: 1px solid rgba(59, 130, 246, 0.22);
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(15, 23, 42, 0.72));
+    color: var(--text-pure);
+    cursor: pointer;
+    padding: 0 16px;
+    font-size: 0.86rem;
+    font-weight: 700;
+    transition: all 0.18s ease;
+}
+
+.mcp-primary-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 16px 30px rgba(59, 130, 246, 0.18);
+}
+
+.mcp-primary-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.mcp-primary-btn.run {
+    margin-top: 4px;
+}
+
+.mcp-quick-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.mcp-chip-btn {
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-soft);
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 600;
+    transition: all 0.16s ease;
+}
+
+.mcp-chip-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.14);
+    color: var(--text-pure);
+}
+
+.mcp-chip-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.mcp-workspace-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 18px;
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mcp-field-label {
+    color: rgba(255, 255, 255, 0.56);
+    font-size: 0.74rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+}
+
+.mcp-tool-select {
+    margin: 0;
+}
+
+.mcp-tool-args {
+    min-height: 84px;
+    margin: 0;
+}
+
+.mcp-tool-args.fancy {
+    min-height: 136px;
+    border-radius: 18px;
+    background: rgba(7, 12, 20, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-pure);
+}
+
+.mcp-tool-help {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.mcp-tool-description-card p,
+.mcp-empty-state-card p {
+    margin: 8px 0 0 0;
+    color: rgba(255, 255, 255, 0.72);
+    line-height: 1.6;
+}
+
+.mcp-example-block {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mcp-example-block pre {
+    margin: 8px 0 0 0;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(7, 12, 20, 0.86);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: #dbeafe;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mcp-empty-state-card h4 {
+    margin: 0;
+    color: var(--text-pure);
+    font-size: 1rem;
 }
 
 /* Centered Message Column */
@@ -547,6 +845,12 @@ main {
     background: rgba(255, 255, 255, 0.08);
     border-color: rgba(255, 255, 255, 0.14);
     color: var(--text-pure);
+}
+
+.mcp-toggle-btn.active {
+    background: rgba(59, 130, 246, 0.18);
+    border-color: rgba(59, 130, 246, 0.28);
+    color: #fff;
 }
 
 .clear-index-btn:hover:not(:disabled) {
@@ -794,6 +1098,13 @@ main {
     .composer-hint {
         max-width: calc(100% - 32px);
     }
+
+    .mcp-workspace-drawer {
+        top: 12px;
+        right: 12px;
+        bottom: 12px;
+        width: min(430px, calc(100% - 24px));
+    }
 }
 
 @media (max-width: 720px) {
@@ -811,6 +1122,32 @@ main {
     .chat-input-area {
         border-radius: 18px;
         margin-bottom: 20px;
+    }
+
+    .chat-header-top {
+        flex-direction: column;
+    }
+
+    .header-workspace-btn {
+        min-width: 100%;
+    }
+
+    .mcp-workspace-drawer {
+        inset: 12px;
+        width: auto;
+    }
+
+    .mcp-workspace-shell {
+        padding: 18px;
+        border-radius: 22px;
+    }
+
+    .mcp-workspace-header {
+        flex-direction: column;
+    }
+
+    .mcp-close-btn {
+        align-self: flex-end;
     }
 
     .settings-modal {

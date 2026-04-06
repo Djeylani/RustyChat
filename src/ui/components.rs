@@ -21,6 +21,122 @@ use crate::rag::{index_directory, get_context};
 const MAX_HISTORY_MESSAGES: i64 = 10000;
 const MAX_TITLE_LEN: usize = 255;
 
+fn parse_mcp_tools_listing(listing: &str) -> Vec<(String, String)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let body = trimmed.strip_prefix("- ")?;
+            if let Some((name, description)) = body.split_once(':') {
+                Some((name.trim().to_string(), description.trim().to_string()))
+            } else {
+                Some((body.trim().to_string(), String::new()))
+            }
+        })
+        .collect()
+}
+
+fn is_path_only_mcp_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file"
+            | "read_text_file"
+            | "read_media_file"
+            | "write_file"
+            | "create_directory"
+            | "list_directory"
+            | "list_directory_with_sizes"
+            | "directory_tree"
+            | "get_file_info"
+    )
+}
+
+fn build_friendly_mcp_command(tool: &str, raw_args: &str) -> Result<String, String> {
+    let trimmed = raw_args.trim();
+    if trimmed.is_empty() {
+        return Ok(format!("/mcp call {tool} {{}}"));
+    }
+
+    if trimmed.starts_with('{') {
+        return Ok(format!("/mcp call {tool} {trimmed}"));
+    }
+
+    if is_path_only_mcp_tool(tool) {
+        let args = serde_json::json!({ "path": trimmed });
+        return Ok(format!("/mcp call {tool} {}", args));
+    }
+
+    match tool {
+        "search_files" => {
+            let (path, pattern) = trimmed
+                .split_once('|')
+                .ok_or_else(|| "For search_files, use `folder path | pattern`, or enter full JSON.".to_string())?;
+            let args = serde_json::json!({
+                "path": path.trim(),
+                "pattern": pattern.trim()
+            });
+            Ok(format!("/mcp call {tool} {}", args))
+        }
+        "read_multiple_files" => {
+            let paths: Vec<String> = trimmed
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.to_string())
+                .collect();
+            if paths.is_empty() {
+                Err("Add one file path per line, or enter full JSON.".to_string())
+            } else {
+                let args = serde_json::json!({ "paths": paths });
+                Ok(format!("/mcp call {tool} {}", args))
+            }
+        }
+        "move_file" => {
+            let (source, destination) = trimmed
+                .split_once("->")
+                .ok_or_else(|| "For move_file, use `source path -> destination path`, or enter full JSON.".to_string())?;
+            let args = serde_json::json!({
+                "source": source.trim(),
+                "destination": destination.trim()
+            });
+            Ok(format!("/mcp call {tool} {}", args))
+        }
+        _ => Err("This tool needs JSON arguments. Use the JSON format shown in its MCP docs or load a simpler filesystem tool.".to_string()),
+    }
+}
+
+fn mcp_tool_example(tool: &str) -> &'static str {
+    match tool {
+        "list_allowed_directories" => "No input needed. Leave the box empty and run the tool.",
+        "list_directory" | "list_directory_with_sizes" | "directory_tree" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp"#
+        }
+        "read_text_file" | "read_file" | "read_media_file" | "get_file_info" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp\README.md"#
+        }
+        "search_files" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp | **/*.md"#
+        }
+        "read_multiple_files" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp\README.md
+C:\Users\tella\Documents\AI-Terminal\mcp\package.json"#
+        }
+        "move_file" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp\old.txt -> C:\Users\tella\Documents\AI-Terminal\mcp\new.txt"#
+        }
+        "create_directory" => {
+            r#"Example:
+C:\Users\tella\Documents\AI-Terminal\mcp\notes"#
+        }
+        _ => "Use simple input when available. If this tool needs structured data, paste full JSON instead.",
+    }
+}
+
 /* ================= SETTINGS MODAL ================= */
 
 #[component]
@@ -538,6 +654,10 @@ pub fn ChatWindow(
     let mcp_status = use_signal(|| Option::<String>::None);
     let mcp_tools_cache = use_signal(|| Option::<String>::None);
     let mcp_last_error = use_signal(|| Option::<String>::None);
+    let mcp_tool_entries = use_signal(|| Vec::<(String, String)>::new());
+    let mut selected_mcp_tool = use_signal(|| "".to_string());
+    let mut mcp_tool_args = use_signal(|| "".to_string());
+    let mut show_mcp_workspace = use_signal(|| false);
     let indexed_chunks = use_signal(|| count_document_chunks(&init_db()));
     let indexed_files = use_signal(|| count_indexed_files(&init_db()));
     let http_client = use_signal(|| Client::new());
@@ -601,6 +721,10 @@ pub fn ChatWindow(
         indexed_files(),
         indexed_chunks()
     );
+    let mcp_is_busy = matches!(
+        mcp_status().as_deref(),
+        Some("starting server") | Some("running command")
+    );
     let mut refresh_index_metrics = {
         let mut indexed_files = indexed_files.clone();
         let mut indexed_chunks = indexed_chunks.clone();
@@ -608,6 +732,89 @@ pub fn ChatWindow(
             let conn = init_db();
             indexed_files.set(count_indexed_files(&conn));
             indexed_chunks.set(count_document_chunks(&conn));
+        }
+    };
+
+    let mut run_mcp_command = {
+        to_owned![
+            current_chat_id,
+            messages,
+            rag_status,
+            mcp_status,
+            mcp_tools_cache,
+            mcp_last_error,
+            mcp_tool_entries,
+            selected_mcp_tool
+        ];
+        move |chat_id: String, command_text: String, user_echo: Option<String>| {
+            if let Some(display_text) = user_echo {
+                let conn = init_db();
+                let _ = conn.execute(
+                    "INSERT INTO messages (chat_id, role, content)
+                     VALUES (?1, 'user', ?2)",
+                    params![chat_id, display_text.clone()],
+                );
+                enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
+                if current_chat_id()
+                    .as_ref()
+                    .map(|c| c == &chat_id)
+                    .unwrap_or(false)
+                {
+                    messages.push(("user".into(), display_text));
+                }
+            }
+
+            mcp_status.set(Some("starting server".to_string()));
+            mcp_last_error.set(None);
+            rag_status.set(Some("MCP: starting server...".to_string()));
+
+            spawn(async move {
+                mcp_status.set(Some("running command".to_string()));
+                rag_status.set(Some("MCP: running command...".to_string()));
+                let mcp_command = crate::db::load_settings(&init_db()).mcp_server_command;
+                let result = handle_mcp_command(&mcp_command, &command_text).await;
+                let conn = init_db();
+                let assistant_text = match result {
+                    Ok(output) => {
+                        mcp_status.set(Some("ready".to_string()));
+                        mcp_last_error.set(None);
+                        if command_text.trim() == "/mcp tools"
+                            || command_text.trim() == "/mcp tools/list"
+                        {
+                            let parsed = parse_mcp_tools_listing(&output);
+                            if selected_mcp_tool().is_empty() {
+                                if let Some((name, _)) = parsed.first() {
+                                    selected_mcp_tool.set(name.clone());
+                                }
+                            }
+                            mcp_tool_entries.set(parsed);
+                            mcp_tools_cache.set(Some(output.clone()));
+                        }
+                        rag_status.set(Some("MCP command completed.".to_string()));
+                        output
+                    }
+                    Err(err) => {
+                        mcp_status.set(Some("error".to_string()));
+                        mcp_last_error.set(Some(err.clone()));
+                        rag_status.set(Some(format!("MCP command failed: {err}")));
+                        format!("MCP Error: {err}")
+                    }
+                };
+
+                let _ = conn.execute(
+                    "INSERT INTO messages (chat_id, role, content)
+                     VALUES (?1, 'assistant', ?2)",
+                    params![chat_id, assistant_text],
+                );
+                enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
+                if current_chat_id()
+                    .as_ref()
+                    .map(|c| c == &chat_id)
+                    .unwrap_or(false)
+                {
+                    messages.push(("assistant".into(), assistant_text));
+                }
+            });
         }
     };
 
@@ -847,6 +1054,24 @@ pub fn ChatWindow(
     } else {
         None
     };
+    let selected_tool_name = selected_mcp_tool();
+    let selected_tool_description = mcp_tool_entries()
+        .iter()
+        .find(|(name, _)| name == &selected_tool_name)
+        .map(|(_, description)| description.clone());
+    let selected_tool_example = mcp_tool_example(&selected_tool_name);
+    let mcp_args_placeholder = match selected_tool_name.as_str() {
+        "list_directory" | "list_directory_with_sizes" | "directory_tree" | "read_text_file"
+        | "read_file" | "read_media_file" | "get_file_info" | "create_directory" => {
+            "Paste a path. RustyChat will fill the JSON for you."
+        }
+        "list_allowed_directories" => "No input needed. Leave this blank.",
+        "search_files" => "Use `folder path | pattern`, for example `C:\\project | **/*.rs`.",
+        "read_multiple_files" => "Paste one file path per line, or enter full JSON.",
+        "move_file" => "Use `source path -> destination path`, or enter full JSON.",
+        "" => "Load MCP tools, then choose one.",
+        _ => "Enter JSON arguments for this tool.",
+    };
     let mut submit_message = {
         to_owned![
             current_chat_id,
@@ -909,50 +1134,7 @@ pub fn ChatWindow(
                 }
 
                 if text.trim_start().starts_with("/mcp") {
-                    let mcp_command = settings().mcp_server_command.clone();
-                    let mut rag_status = rag_status.clone();
-                    let mut mcp_status = mcp_status.clone();
-                    let mut mcp_tools_cache = mcp_tools_cache.clone();
-                    let mut mcp_last_error = mcp_last_error.clone();
-                    mcp_status.set(Some("starting server".to_string()));
-                    mcp_last_error.set(None);
-                    rag_status.set(Some("MCP: starting server...".to_string()));
-                    spawn(async move {
-                        mcp_status.set(Some("running command".to_string()));
-                        rag_status.set(Some("MCP: running command...".to_string()));
-                        let result = handle_mcp_command(&mcp_command, &text).await;
-                        let conn = init_db();
-                        let assistant_text = match result {
-                            Ok(output) => {
-                                mcp_status.set(Some("ready".to_string()));
-                                mcp_last_error.set(None);
-                                if text.trim() == "/mcp tools" || text.trim() == "/mcp tools/list" {
-                                    mcp_tools_cache.set(Some(output.clone()));
-                                }
-                                rag_status.set(Some("MCP command completed.".to_string()));
-                                output
-                            }
-                            Err(err) => {
-                                mcp_status.set(Some("error".to_string()));
-                                mcp_last_error.set(Some(err.clone()));
-                                rag_status.set(Some(format!("MCP command failed: {err}")));
-                                format!("MCP Error: {err}")
-                            }
-                        };
-                        let _ = conn.execute(
-                            "INSERT INTO messages (chat_id, role, content)
-                             VALUES (?1, 'assistant', ?2)",
-                            params![chat_id, assistant_text],
-                        );
-                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-                        if current_chat_id()
-                            .as_ref()
-                            .map(|c| c == &chat_id)
-                            .unwrap_or(false)
-                        {
-                            messages.push(("assistant".into(), assistant_text));
-                        }
-                    });
+                    run_mcp_command(chat_id, text, None);
                 } else {
                     let cancel_flag = Arc::new(AtomicBool::new(false));
                     current_cancel.set(Some(cancel_flag.clone()));
@@ -971,11 +1153,23 @@ pub fn ChatWindow(
         div { class: "chat-window",
 
             div { class: "chat-header",
-                h2 { "{header_title}" }
-                p { class: "model-indicator", "Model: {model_display}" }
-                p { class: "model-indicator secondary", "Embeddings: {embed_model_display}" }
-                p { class: "model-indicator secondary", "{mcp_display}" }
-                p { class: "model-indicator secondary", "{corpus_display}" }
+                div { class: "chat-header-top",
+                    div {
+                        h2 { "{header_title}" }
+                        p { class: "model-indicator", "Model: {model_display}" }
+                        p { class: "model-indicator secondary", "Embeddings: {embed_model_display}" }
+                        p { class: "model-indicator secondary", "{mcp_display}" }
+                        p { class: "model-indicator secondary", "{corpus_display}" }
+                    }
+
+                    if !settings().mcp_server_command.trim().is_empty() {
+                        button {
+                            class: if show_mcp_workspace() { "header-workspace-btn active" } else { "header-workspace-btn" },
+                            onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
+                            if show_mcp_workspace() { "Hide MCP" } else { "Open MCP" }
+                        }
+                    }
+                }
             }
 
             div { class: "chat-messages",
@@ -1010,6 +1204,14 @@ pub fn ChatWindow(
             }
 
             div { class: "chat-input-area",
+                if !settings().mcp_server_command.trim().is_empty() {
+                    button {
+                        class: if show_mcp_workspace() { "secondary-action-btn mcp-toggle-btn active" } else { "secondary-action-btn mcp-toggle-btn" },
+                        disabled: mcp_is_busy,
+                        onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
+                        if show_mcp_workspace() { "MCP Panel" } else { "MCP" }
+                    }
+                }
                 button {
                     class: "send-button big", // reusing style
                     disabled: is_indexing(),
@@ -1031,15 +1233,26 @@ pub fn ChatWindow(
                                 let status = match index_directory(&path_str, &embed_model).await {
                                     Ok(stats) => {
                                         let conn = init_db();
-                                        indexed_files.set(count_indexed_files(&conn));
-                                        indexed_chunks.set(count_document_chunks(&conn));
-                                        format!(
-                                            "Indexed {} files and {} chunks from {} (replaced {} old chunks).",
-                                            stats.files_indexed,
-                                            stats.chunks_indexed,
-                                            path_str,
-                                            stats.chunks_replaced
-                                        )
+                                        let total_files = count_indexed_files(&conn);
+                                        let total_chunks = count_document_chunks(&conn);
+                                        indexed_files.set(total_files);
+                                        indexed_chunks.set(total_chunks);
+                                        if stats.files_indexed == 0 || stats.chunks_indexed == 0 {
+                                            format!(
+                                                "No supported text files were indexed from {}. Supported types: .rs, .md, .txt, .py, .js, .ts, .toml, .json, .c, .cpp, .h",
+                                                path_str
+                                            )
+                                        } else {
+                                            format!(
+                                                "Indexed {} files and {} chunks from {} (replaced {} old chunks). Corpus now has {} files and {} chunks.",
+                                                stats.files_indexed,
+                                                stats.chunks_indexed,
+                                                path_str,
+                                                stats.chunks_replaced,
+                                                total_files,
+                                                total_chunks
+                                            )
+                                        }
                                     }
                                     Err(err) => format!("Indexing failed: {}", err),
                                 };
@@ -1103,6 +1316,146 @@ pub fn ChatWindow(
                     disabled: !can_send,
                     onclick: move |_| submit_message(),
                     "➤ Send"
+                }
+            }
+
+            if !settings().mcp_server_command.trim().is_empty() && show_mcp_workspace() {
+                div {
+                    class: "mcp-workspace-backdrop",
+                    onclick: move |_| show_mcp_workspace.set(false),
+                }
+                aside { class: "mcp-workspace-drawer",
+                    div { class: "mcp-workspace-shell",
+                        div { class: "mcp-workspace-header",
+                            div {
+                                span { class: "mcp-workspace-kicker", "Tool Workspace" }
+                                h3 { "MCP Control Desk" }
+                                p { "Load tools once, then run filesystem actions with simpler inputs instead of slash commands and raw JSON." }
+                            }
+                            button {
+                                class: "mcp-close-btn",
+                                onclick: move |_| show_mcp_workspace.set(false),
+                                "×"
+                            }
+                        }
+
+                        div { class: "mcp-status-card",
+                            span { class: "mcp-status-pill", "{mcp_display}" }
+                            if let Some(err) = mcp_last_error() {
+                                p { class: "mcp-status-copy error", "{err}" }
+                            } else if let Some(status) = rag_status() {
+                                p { class: "mcp-status-copy", "{status}" }
+                            } else {
+                                p { class: "mcp-status-copy", "Use this workspace to load tools, inspect files, and run MCP actions without remembering command syntax." }
+                            }
+                        }
+
+                        div { class: "mcp-toolbar",
+                            button {
+                                class: "mcp-primary-btn",
+                                disabled: current_chat_id().is_none() || mcp_is_busy,
+                                onclick: move |_| {
+                                    if let Some(chat_id) = current_chat_id() {
+                                        run_mcp_command(
+                                            chat_id,
+                                            "/mcp tools".to_string(),
+                                            Some("Load MCP tools".to_string()),
+                                        );
+                                    }
+                                },
+                                if mcp_is_busy { "Working..." } else { "Load Tools" }
+                            }
+                            div { class: "mcp-quick-actions",
+                                button {
+                                    class: "mcp-chip-btn",
+                                    disabled: mcp_is_busy,
+                                    onclick: move |_| selected_mcp_tool.set("list_directory".to_string()),
+                                    "Browse Folder"
+                                }
+                                button {
+                                    class: "mcp-chip-btn",
+                                    disabled: mcp_is_busy,
+                                    onclick: move |_| selected_mcp_tool.set("directory_tree".to_string()),
+                                    "Show Tree"
+                                }
+                                button {
+                                    class: "mcp-chip-btn",
+                                    disabled: mcp_is_busy,
+                                    onclick: move |_| selected_mcp_tool.set("read_text_file".to_string()),
+                                    "Read File"
+                                }
+                                button {
+                                    class: "mcp-chip-btn",
+                                    disabled: mcp_is_busy,
+                                    onclick: move |_| selected_mcp_tool.set("search_files".to_string()),
+                                    "Search Files"
+                                }
+                            }
+                        }
+
+                        if !mcp_tool_entries().is_empty() {
+                            div { class: "mcp-workspace-form",
+                                label { class: "mcp-field-label", "Tool" }
+                                select {
+                                    class: "input mcp-tool-select",
+                                    value: "{selected_mcp_tool}",
+                                    onchange: move |e| selected_mcp_tool.set(e.value()),
+                                    {mcp_tool_entries().iter().map(|(name, _)| rsx!(
+                                        option { value: "{name}", selected: name == &selected_mcp_tool(), "{name}" }
+                                    ))}
+                                }
+
+                                label { class: "mcp-field-label", "Input" }
+                                textarea {
+                                    class: "textarea mcp-tool-args fancy",
+                                    value: "{mcp_tool_args}",
+                                    placeholder: "{mcp_args_placeholder}",
+                                    oninput: move |e| mcp_tool_args.set(e.value()),
+                                    disabled: mcp_is_busy,
+                                }
+
+                                button {
+                                    class: "mcp-primary-btn run",
+                                    disabled: current_chat_id().is_none() || selected_mcp_tool().trim().is_empty() || mcp_is_busy,
+                                    onclick: move |_| {
+                                        if let Some(chat_id) = current_chat_id() {
+                                            let tool = selected_mcp_tool();
+                                            match build_friendly_mcp_command(&tool, &mcp_tool_args()) {
+                                                Ok(command) => {
+                                                    let summary = if mcp_tool_args().trim().is_empty() {
+                                                        format!("Run MCP tool: {tool}")
+                                                    } else {
+                                                        format!("Run MCP tool: {tool} {}", mcp_tool_args().trim())
+                                                    };
+                                                    run_mcp_command(chat_id, command, Some(summary));
+                                                }
+                                                Err(err) => {
+                                                    rag_status.set(Some(err));
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "Run Tool"
+                                }
+                            }
+
+                            if let Some(description) = selected_tool_description {
+                                div { class: "mcp-tool-description-card",
+                                    span { class: "mcp-field-label", "What this tool does" }
+                                    p { "{description}" }
+                                    div { class: "mcp-example-block",
+                                        span { class: "mcp-field-label", "Quick format" }
+                                        pre { "{selected_tool_example}" }
+                                    }
+                                }
+                            }
+                        } else {
+                            div { class: "mcp-empty-state-card",
+                                h4 { "No tools loaded yet" }
+                                p { "Click `Load Tools` to fetch the server's available actions. Once loaded, this panel will give you tool selection and simpler inputs." }
+                            }
+                        }
+                    }
                 }
             }
 
