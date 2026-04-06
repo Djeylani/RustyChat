@@ -9,7 +9,7 @@ title = "rusty-chat"
 [web.resource]
 
 # Additional CSS style files
-style = []
+style = ["assets/main.css"]
 
 # Additional JavaScript files
 script = []
