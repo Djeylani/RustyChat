@@ -100,8 +100,17 @@ This is a safer execution boundary, not a full sandbox.
 
 ## Screenshots
 
-![screenshot1](./assets/screenshot-1.png)
-![screenshot2](./assets/screenshot-2.png)
+Main workspace
+
+![Main workspace](./assets/screenshot-main.png)
+
+MCP integration settings
+
+![MCP settings](./assets/screenshot-settings.png)
+
+MCP Control Desk
+
+![MCP Control Desk](./assets/screenshot-mcp.png)
 
 ## License
 
