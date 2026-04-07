@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use dioxus::desktop::{Config, WindowBuilder, LogicalSize};
 use rusqlite::params;
 use uuid::Uuid;
-use crate::db::{init_db, load_settings};
+use crate::db::{count_chat_messages, init_db, load_chat_messages, load_settings};
 use crate::ui::{Sidebar, ChatWindow, SettingsModal, ToastHost, CSS};
 
 mod db;
@@ -34,10 +34,12 @@ fn main() {
 #[component]
 fn App() -> Element {
     let conn = init_db();
+    const INITIAL_MESSAGE_WINDOW: i64 = 160;
 
     let chats = use_signal(|| Vec::<(String, String)>::new());
     let current_chat_id = use_signal(|| Option::<String>::None);
     let messages = use_signal(|| Vec::<(String, String)>::new());
+    let message_count = use_signal(|| 0_usize);
     let toasts = use_signal(|| Vec::new());
 
     // settings and modal visibility
@@ -49,6 +51,7 @@ fn App() -> Element {
         let mut chats = chats.clone();
         let mut current_chat_id = current_chat_id.clone();
         let mut messages = messages.clone();
+        let mut message_count = message_count.clone();
         use_effect(move || {
             let conn = init_db();
             let mut loaded_chats: Vec<(String, String)> = {
@@ -79,28 +82,19 @@ fn App() -> Element {
 
             let selected_chat_id = loaded_chats.first().map(|(id, _)| id.clone());
             let selected_messages = if let Some(chat_id) = selected_chat_id.as_ref() {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT role, content FROM messages
-                         WHERE chat_id = ?1 ORDER BY id DESC LIMIT 10000",
-                    )
-                    .unwrap();
-                let rows = stmt
-                    .query_map(params![chat_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .unwrap();
-
-                let mut collected: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
-                collected.reverse();
-                collected
+                load_chat_messages(&conn, chat_id, INITIAL_MESSAGE_WINDOW)
             } else {
                 Vec::new()
             };
+            let selected_message_count = selected_chat_id
+                .as_ref()
+                .map(|chat_id| count_chat_messages(&conn, chat_id) as usize)
+                .unwrap_or(0);
 
             chats.set(loaded_chats);
             current_chat_id.set(selected_chat_id);
             messages.set(selected_messages);
+            message_count.set(selected_message_count);
         });
     }
 
@@ -120,11 +114,13 @@ fn App() -> Element {
                     chats: chats.clone(),
                     current_chat_id: current_chat_id.clone(),
                     messages: messages.clone(),
+                    message_count: message_count.clone(),
                     show_settings: show_settings.clone()
                 }
                 ChatWindow {
                     current_chat_id: current_chat_id.clone(),
                     messages: messages.clone(),
+                    message_count: message_count.clone(),
                     settings: settings.clone(),
                     chats: chats.clone(),
                     toasts: toasts.clone()
@@ -137,6 +133,7 @@ fn App() -> Element {
                     show_settings: show_settings.clone(),
                     chats: chats.clone(),
                     messages: messages.clone(),
+                    message_count: message_count.clone(),
                     current_chat_id: current_chat_id.clone(),
                     toasts: toasts.clone()
                 }

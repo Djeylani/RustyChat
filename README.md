@@ -1,64 +1,51 @@
 # RustyChat
 
-RustyChat is a lightweight, desktop chat UI written in Rust using Dioxus. It provides a simple, focused chat interface that stores conversation history in a local SQLite database while sending requests to a local Ollama backend for model inference. The UI is dark-themed, supports per-chat naming, renaming, persistent history, model selection, and an interrupt button to stop an in-flight model response.
+RustyChat is a local-first desktop AI workspace built with Rust and Dioxus. It combines Ollama chat, vision-capable prompts, local RAG, inline code execution, and MCP integrations in a single desktop app with SQLite-backed persistence.
 
-This project is intended as a compact, privacy-friendly GUI wrapper around local model hosting via Ollama.
+## What It Does
 
-## Features
+- Chats with local Ollama models through `/api/chat`
+- Supports file, image, and folder attachments directly in chat
+- Passes attached images to vision-capable Ollama models
+- Indexes local folders with Ollama embeddings for RAG-style context injection
+- Runs generated Python, JavaScript, Bash, and PowerShell snippets with opt-in execution controls
+- Connects to MCP servers over `filesystem`, `stdio`, and `http`
+- Stores chats, settings, RAG chunks, and app error logs in local SQLite
 
-- Desktop chat UI built with Dioxus.
-- Persistent history stored in `chat.db` (SQLite).
-- Model selection populated from Ollama's `/api/tags` endpoint.
-- Settings modal to configure model, system prompt, temperature, top_p, max_tokens, and zoom.
-- Dark theme with careful styling and responsive layout.
+## Current Feature Set
 
-## Powered by
+- Modular architecture split across `db`, `ui`, `ollama`, `rag`, `executor`, and `mcp`
+- Searchable sidebar with persistent chats and rename/delete controls
+- Rich markdown rendering with code block copy/run actions
+- Shared in-app toast notifications for success, warning, and error states
+- Multi-server MCP configuration with active switching, auth headers, custom headers, and env vars
+- Tool-friendly MCP result cards for common filesystem outputs
+- DB-backed long-history loading so large chats do not all render at once
+- Global zoom control and responsive desktop layout
 
-- Dioxus — desktop RUST UI framework
-- Ollama — local model hosting backend used for inference
+## Requirements
 
-If you haven't installed Ollama, please visit https://ollama.com/ and follow their installation instructions. The app expects Ollama to be available at:
+- Rust
+- Cargo
+- Ollama running locally
+- At least one Ollama chat model installed
 
-- http://localhost:11434
+Optional:
 
-You can test the model list with:
+- An embedding-capable Ollama model for RAG
+- MCP servers or folders/endpoints you want to connect to
+
+RustyChat expects Ollama at:
+
+- `http://localhost:11434`
+
+You can verify that with:
 
 ```bash
 curl http://localhost:11434/api/tags
 ```
 
-## Screenshots
-
-![screenshot1](./assets/screenshot-1.png)
-![screenshot2](./assets/screenshot-2.png)
-
-## Crates used and what they do
-
-- dioxus (and dioxus-desktop): UI framework used to build the desktop application and components.
-- reqwest: HTTP client used to call Ollama's REST API.
-- rusqlite: SQLite bindings to persist chats and messages locally (`chat.db`).
-- serde, serde_json: Serialization and Deserialization for JSON payloads exchanged with Ollama and for internal data flows.
-- uuid: Generate UUIDs for chat identifiers.
-- tokio (indirect / runtime used by Dioxus): asynchronous runtime used by async networking.
-
-These crates are chosen for their ergonomics and small, practical APIs for a local GUI chat app.
-
-## How it works
-
-- Chats are stored in `chats` table with columns `(id TEXT PRIMARY KEY, title TEXT NOT NULL)` where `id` is a UUID string and `title` is the visible name.
-- Messages are stored in `messages` table with `(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, timestamp DATETIME)`.
-- Settings are persisted in a `settings` table (single-row, id=1).
-- The UI keeps a small in-memory buffer of the currently-viewed chat's messages for immediate responsiveness, but assistant responses are always written to the DB. Assistant replies are only pushed into the in-memory buffer if the user is still viewing that chat when the response arrives. This prevents replies from "appearing" in the wrong visible chat.
-- When interrupting a running request, the in-flight HTTP call is allowed to complete, but the code marks the request as cancelled and simply discards the final assistant output (no interruption message is inserted). The UI removes the "Thinking..." indicator immediately for a responsive feel.
-
-## Build & Run
-
-Requirements:
-
-- Rust
-- Cargo
-- Ollama running locally and hosting models
-- Git
+## Build And Run
 
 1. Clone the repository
 
@@ -67,25 +54,53 @@ git clone https://github.com/KPCOFGS/RustyChat.git
 cd RustyChat
 ```
 
-2. Run
+2. Run the app in development
+
+```bash
+cargo run
+```
+
+3. Or build a release binary
 
 ```bash
 dx build --release
 ```
 
-3. Run
+## How Persistence Works
 
-```bash
-./target/dx/rusty-chat/release/linux/app/rusty-chat
-```
-Notes:
+- Chats are stored in the `chats` table
+- Messages are stored in the `messages` table
+- App settings are stored in the `settings` table
+- Indexed RAG chunks are stored in the `document_chunks` table
+- App-level error logs are stored in the `app_logs` table
 
-- The app creates/uses `chat.db` in the `./target/dx/rusty-chat/release/linux/app/` directory. Backup if necessary before deleting.
+The app uses a local `chat.db` SQLite database in the runtime working directory.
 
-## Contribution
+## MCP Integrations
 
-Contributions welcome. Please open issues or PRs for bugs, feature requests, or improvements.
+RustyChat supports three MCP connection styles:
+
+- `Filesystem`: point at a local folder and launch the filesystem MCP server for it
+- `StdIO`: launch a full MCP command directly
+- `HTTP`: call an MCP endpoint with optional auth and custom headers
+
+The settings UI lets you save multiple MCP integrations, switch the active integration, and use the MCP Control Desk to load tools and run calls without memorizing raw command syntax.
+
+## Inline Code Execution
+
+Inline execution is disabled by default. When enabled in Settings, RustyChat:
+
+- Runs supported snippets in a temp working directory
+- Applies a configurable timeout
+- Caps captured output to keep the UI responsive
+
+This is a safer execution boundary, not a full sandbox.
+
+## Screenshots
+
+![screenshot1](./assets/screenshot-1.png)
+![screenshot2](./assets/screenshot-2.png)
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](./LICENSE) file for more details.
+This project is licensed under the MIT License. See [LICENSE](./LICENSE) for details.

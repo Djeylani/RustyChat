@@ -95,6 +95,18 @@ pub fn init_db() -> Connection {
     )
     .unwrap();
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            level TEXT NOT NULL,
+            source TEXT NOT NULL,
+            message TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN embed_model TEXT NOT NULL DEFAULT ''",
         [],
@@ -319,6 +331,47 @@ pub fn count_indexed_files(conn: &Connection) -> i64 {
         |row| row.get(0),
     )
     .unwrap_or(0)
+}
+
+pub fn count_chat_messages(conn: &Connection, chat_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE chat_id = ?1",
+        params![chat_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+pub fn load_chat_messages(conn: &Connection, chat_id: &str, limit: i64) -> Vec<(String, String)> {
+    let mut stmt = match conn.prepare(
+        "SELECT role, content FROM messages
+         WHERE chat_id = ?1 ORDER BY id DESC LIMIT ?2"
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match stmt.query_map(params![chat_id, limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut collected: Vec<(String, String)> = rows.filter_map(Result::ok).collect();
+    collected.reverse();
+    collected
+}
+
+pub fn log_app_event(conn: &Connection, level: &str, source: &str, message: &str) {
+    let _ = conn.execute(
+        "INSERT INTO app_logs (level, source, message) VALUES (?1, ?2, ?3)",
+        params![level, source, message],
+    );
+}
+
+pub fn log_app_error(conn: &Connection, source: &str, message: &str) {
+    log_app_event(conn, "error", source, message);
 }
 
 /* Helper to enforce history length in DB per chat - deletes oldest messages beyond history limit */

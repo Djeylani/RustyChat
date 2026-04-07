@@ -13,8 +13,9 @@ use uuid::Uuid;
 use rfd::FileDialog;
 
 use crate::db::{
-    clear_document_chunks, count_document_chunks, count_indexed_files, enforce_history_limit,
-    init_db, save_settings, Settings, clamp_to_i32, McpKeyValue, McpServerConfig, McpTransport,
+    clear_document_chunks, count_chat_messages, count_document_chunks, count_indexed_files,
+    enforce_history_limit, init_db, load_chat_messages, log_app_error, save_settings, Settings,
+    clamp_to_i32, McpKeyValue, McpServerConfig, McpTransport,
 };
 use crate::mcp::handle_mcp_command;
 use crate::ollama::{OllamaChatRequest, OllamaChatResponse, OllamaMessage};
@@ -53,6 +54,7 @@ struct ChatAttachment {
 #[serde(rename_all = "snake_case")]
 enum AttachmentKind {
     File,
+    Folder,
     Image,
 }
 
@@ -73,6 +75,8 @@ fn make_attachment(path: &Path) -> ChatAttachment {
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
     ) {
         AttachmentKind::Image
+    } else if path.is_dir() {
+        AttachmentKind::Folder
     } else {
         AttachmentKind::File
     };
@@ -182,6 +186,9 @@ fn build_attachment_prompt(attachments: &[ChatAttachment]) -> String {
                     attachment.name, attachment.path
                 ));
             }
+            AttachmentKind::Folder => {
+                sections.push(build_folder_attachment_prompt(attachment));
+            }
             AttachmentKind::File => {
                 if is_prompt_text_file(&attachment.path) {
                     match std::fs::read_to_string(&attachment.path) {
@@ -217,6 +224,66 @@ fn build_attachment_prompt(attachments: &[ChatAttachment]) -> String {
     } else {
         format!("Attached items:\n{}", sections.join("\n\n"))
     }
+}
+
+fn build_folder_attachment_prompt(attachment: &ChatAttachment) -> String {
+    const MAX_FOLDER_FILES: usize = 24;
+    const MAX_FOLDER_PREVIEWS: usize = 4;
+    const MAX_FOLDER_CHARS: usize = 2_500;
+
+    let mut listed_paths = Vec::new();
+    let mut previews = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&attachment.path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+    {
+        if listed_paths.len() >= MAX_FOLDER_FILES {
+            break;
+        }
+        let entry_path = entry.path().to_string_lossy().to_string();
+        listed_paths.push(entry_path.clone());
+
+        if previews.len() < MAX_FOLDER_PREVIEWS && is_prompt_text_file(&entry_path) {
+            if let Ok(mut content) = std::fs::read_to_string(&entry_path) {
+                if content.len() > MAX_FOLDER_CHARS {
+                    content.truncate(MAX_FOLDER_CHARS);
+                    content.push_str("\n[truncated]");
+                }
+                let name = entry
+                    .path()
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&entry_path);
+                previews.push(format!("Preview from {}:\n```text\n{}\n```", name, content));
+            }
+        }
+    }
+
+    let mut sections = vec![format!(
+        "Attached folder: {} ({})",
+        attachment.name, attachment.path
+    )];
+
+    if listed_paths.is_empty() {
+        sections.push("The folder does not contain readable files.".to_string());
+    } else {
+        sections.push(format!(
+            "Folder contents:\n{}",
+            listed_paths
+                .iter()
+                .map(|path| format!("- {}", path))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if !previews.is_empty() {
+        sections.push(previews.join("\n\n"));
+    }
+
+    sections.join("\n\n")
 }
 
 fn attachment_image_payload(path: &str) -> Option<String> {
@@ -286,33 +353,48 @@ fn persist_chat_message(conn: &Connection, chat_id: &str, role: &str, content: &
     enforce_history_limit(conn, chat_id, MAX_HISTORY_MESSAGES);
 }
 
-fn push_visible_message(
+fn refresh_visible_chat_window(
     current_chat_id: Signal<Option<String>>,
     mut messages: Signal<Vec<(String, String)>>,
+    mut message_count: Signal<usize>,
     chat_id: &str,
-    role: &str,
-    content: &str,
+    window_limit: usize,
 ) {
     if current_chat_id()
         .as_ref()
         .map(|current| current == chat_id)
         .unwrap_or(false)
     {
-        messages.push((role.to_string(), content.to_string()));
+        let conn = init_db();
+        messages.set(load_chat_messages(&conn, chat_id, window_limit as i64));
+        message_count.set(count_chat_messages(&conn, chat_id) as usize);
     }
 }
 
 fn persist_and_push_message(
     current_chat_id: Signal<Option<String>>,
     messages: Signal<Vec<(String, String)>>,
+    message_count: Signal<usize>,
     chat_id: &str,
     role: &str,
     content: impl Into<String>,
+    window_limit: usize,
 ) {
     let content = content.into();
     let conn = init_db();
     persist_chat_message(&conn, chat_id, role, &content);
-    push_visible_message(current_chat_id, messages, chat_id, role, &content);
+    refresh_visible_chat_window(
+        current_chat_id,
+        messages,
+        message_count,
+        chat_id,
+        window_limit,
+    );
+}
+
+fn record_ui_error(source: &str, message: impl AsRef<str>) {
+    let conn = init_db();
+    log_app_error(&conn, source, message.as_ref());
 }
 
 fn parse_mcp_tools_listing(listing: &str) -> Vec<(String, String)> {
@@ -564,6 +646,7 @@ pub fn SettingsModal(
     show_settings: Signal<bool>,
     chats: Signal<Vec<(String, String)>>,
     messages: Signal<Vec<(String, String)>>,
+    message_count: Signal<usize>,
     current_chat_id: Signal<Option<String>>,
     toasts: Signal<Vec<ToastNotification>>,
 ) -> Element {
@@ -752,7 +835,7 @@ pub fn SettingsModal(
     };
 
     let delete_all = {
-        to_owned![chats, messages, current_chat_id, show_settings];
+        to_owned![chats, messages, message_count, current_chat_id, show_settings];
         move |_| {
             let conn = init_db();
             conn.execute("DELETE FROM messages", []).ok();
@@ -760,6 +843,7 @@ pub fn SettingsModal(
 
             chats.set(vec![]);
             messages.set(vec![]);
+            message_count.set(0);
             current_chat_id.set(None);
             show_settings.set(false);
         }
@@ -1183,6 +1267,7 @@ pub fn Sidebar(
     chats: Signal<Vec<(String, String)>>,
     current_chat_id: Signal<Option<String>>,
     messages: Signal<Vec<(String, String)>>,
+    message_count: Signal<usize>,
     show_settings: Signal<bool>,
 ) -> Element {
     let mut editing_chat = use_signal(|| Option::<String>::None);
@@ -1215,6 +1300,7 @@ pub fn Sidebar(
                     chats.push((new_id.clone(), title));
                     current_chat_id.set(Some(new_id));
                     messages.set(vec![]);
+                    message_count.set(0);
                     search_query.set("".to_string());
                 },
                 "➕ New Chat"
@@ -1241,6 +1327,7 @@ pub fn Sidebar(
 
                     let mut chats_handle = chats.clone();
                     let mut messages_handle = messages.clone();
+                    let mut message_count_handle = message_count.clone();
                     let mut current_chat_handle = current_chat_id.clone();
                     let mut editing_chat_handle = editing_chat.clone();
                     let mut edit_text_handle = edit_text.clone();
@@ -1257,20 +1344,8 @@ pub fn Sidebar(
                                 },
                                 onclick: move |_| {
                                     let conn = init_db();
-                                    let mut stmt = conn.prepare(
-                                        "SELECT role, content FROM messages
-                                         WHERE chat_id = ? ORDER BY id DESC LIMIT ?"
-                                    ).unwrap();
-
-                                    let rows = stmt
-                                        .query_map(params![&id_for_open, MAX_HISTORY_MESSAGES], |row| {
-                                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                                        })
-                                        .unwrap();
-
-                                    let mut collected: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
-                                    collected.reverse();
-                                    messages_handle.set(collected);
+                                    messages_handle.set(load_chat_messages(&conn, &id_for_open, 160));
+                                    message_count_handle.set(count_chat_messages(&conn, &id_for_open) as usize);
                                     current_chat_handle.set(Some(id_for_open.clone()));
                                 },
 
@@ -1367,7 +1442,8 @@ pub fn Sidebar(
 
                                                             if current_chat_handle() == Some(id_for_delete.clone()) {
                                                                 current_chat_handle.set(None);
-                                                                    messages_handle.set(vec![]);
+                                                                messages_handle.set(vec![]);
+                                                                message_count_handle.set(0);
                                                             }
                                                         },
                                                         title: "Delete chat",
@@ -1411,6 +1487,7 @@ pub fn Sidebar(
 pub fn ChatWindow(
     current_chat_id: Signal<Option<String>>,
     messages: Signal<Vec<(String, String)>>,
+    message_count: Signal<usize>,
     settings: Signal<Settings>,
     chats: Signal<Vec<(String, String)>>,
     toasts: Signal<Vec<ToastNotification>>,
@@ -1430,6 +1507,7 @@ pub fn ChatWindow(
     let mut mcp_tool_args = use_signal(|| "".to_string());
     let mut show_mcp_workspace = use_signal(|| false);
     let mut visible_message_count = use_signal(|| 160_usize);
+    const MESSAGE_WINDOW_SIZE: usize = 160;
     let indexed_chunks = use_signal(|| count_document_chunks(&init_db()));
     let indexed_files = use_signal(|| count_indexed_files(&init_db()));
     let http_client = use_signal(|| Client::new());
@@ -1457,7 +1535,7 @@ pub fn ChatWindow(
         let mut visible_message_count = visible_message_count.clone();
         use_effect(move || {
             let _current = current_chat_id();
-            visible_message_count.set(160);
+            visible_message_count.set(MESSAGE_WINDOW_SIZE);
         });
     }
 
@@ -1532,6 +1610,8 @@ pub fn ChatWindow(
         to_owned![
             current_chat_id,
             messages,
+            message_count,
+            visible_message_count,
             rag_status,
             mcp_status,
             mcp_tools_cache,
@@ -1545,9 +1625,11 @@ pub fn ChatWindow(
                 persist_and_push_message(
                     current_chat_id,
                     messages,
+                    message_count,
                     &chat_id,
                     "user",
                     display_text,
+                    visible_message_count().max(MESSAGE_WINDOW_SIZE),
                 );
             }
 
@@ -1560,6 +1642,7 @@ pub fn ChatWindow(
                 rag_status.set(Some("MCP: running command...".to_string()));
                 let current_settings = crate::db::load_settings(&init_db());
                 let Some(active_server) = current_settings.active_mcp_server() else {
+                    record_ui_error("mcp", "No active MCP server is configured.");
                     mcp_status.set(Some("error".to_string()));
                     mcp_last_error.set(Some("No active MCP server is configured.".to_string()));
                     rag_status.set(Some("MCP command failed: no active server configured.".to_string()));
@@ -1599,6 +1682,7 @@ pub fn ChatWindow(
                         output
                     }
                     Err(err) => {
+                        record_ui_error("mcp", &err);
                         mcp_status.set(Some("error".to_string()));
                         mcp_last_error.set(Some(err.clone()));
                         rag_status.set(Some(format!("MCP command failed: {err}")));
@@ -1613,7 +1697,13 @@ pub fn ChatWindow(
                 };
 
                 persist_chat_message(&conn, &chat_id, "assistant", &assistant_text);
-                push_visible_message(current_chat_id, messages, &chat_id, "assistant", &assistant_text);
+                refresh_visible_chat_window(
+                    current_chat_id,
+                    messages,
+                    message_count,
+                    &chat_id,
+                    visible_message_count().max(MESSAGE_WINDOW_SIZE),
+                );
             });
         }
     };
@@ -1621,6 +1711,8 @@ pub fn ChatWindow(
     let send_to_ollama = {
         to_owned![
             messages,
+            message_count,
+            visible_message_count,
             http_client,
             loading_chat,
             current_cancel,
@@ -1641,12 +1733,15 @@ pub fn ChatWindow(
                 let s = settings();
                 if s.model.trim().is_empty() {
                     let db_msg = "Error: No model selected. Please open Settings and choose a model before sending messages.";
+                    record_ui_error("ollama", db_msg);
                     persist_and_push_message(
                         current_chat_id,
                         messages,
+                        message_count,
                         &chat_id,
                         "assistant",
                         db_msg,
+                        visible_message_count().max(MESSAGE_WINDOW_SIZE),
                     );
 
                     push_toast(
@@ -1674,6 +1769,7 @@ pub fn ChatWindow(
                             rag_status.set(Some("No indexed context matched this message.".to_string()));
                         }
                         Err(err) => {
+                            record_ui_error("rag", format!("RAG lookup failed: {err}"));
                             rag_status.set(Some(format!("RAG lookup failed: {err}")));
                         }
                     }
@@ -1757,21 +1853,25 @@ pub fn ChatWindow(
                                         persist_and_push_message(
                                             current_chat_id,
                                             messages,
+                                            message_count,
                                             &chat_id,
                                             "assistant",
                                             api_response.message.content,
+                                            visible_message_count().max(MESSAGE_WINDOW_SIZE),
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to parse Ollama response: {}", e);
+                                    record_ui_error("ollama", format!("Failed to parse Ollama response: {e}"));
                                     let err_text = "Error: Failed to parse response from Ollama";
                                     persist_and_push_message(
                                         current_chat_id,
                                         messages,
+                                        message_count,
                                         &chat_id,
                                         "assistant",
                                         err_text,
+                                        visible_message_count().max(MESSAGE_WINDOW_SIZE),
                                     );
                                     push_toast(
                                         toasts,
@@ -1782,15 +1882,17 @@ pub fn ChatWindow(
                                 }
                             }
                         } else {
-                            eprintln!("Ollama API error: {}", response.status());
+                            record_ui_error("ollama", format!("Ollama API returned status {}", response.status()));
                             let err_text =
                                 format!("Error: Ollama API returned status {}", response.status());
                             persist_and_push_message(
                                 current_chat_id,
                                 messages,
+                                message_count,
                                 &chat_id,
                                 "assistant",
                                 err_text,
+                                visible_message_count().max(MESSAGE_WINDOW_SIZE),
                             );
                             push_toast(
                                 toasts,
@@ -1801,14 +1903,16 @@ pub fn ChatWindow(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to send request to Ollama: {}", e);
+                        record_ui_error("ollama", format!("Could not connect to Ollama: {e}"));
                         let err_text = "Error: Could not connect to Ollama. Make sure Ollama is running at http://localhost:11434";
                         persist_and_push_message(
                             current_chat_id,
                             messages,
+                            message_count,
                             &chat_id,
                             "assistant",
                             err_text,
+                            visible_message_count().max(MESSAGE_WINDOW_SIZE),
                         );
                         push_toast(
                             toasts,
@@ -1834,9 +1938,8 @@ pub fn ChatWindow(
         .map(|l| current_chat_id().as_ref().map(|c| c != l).unwrap_or(false))
         .unwrap_or(false);
     let has_model = !settings().model.trim().is_empty();
-    let total_messages = messages().len();
+    let total_messages = message_count();
     let hidden_message_count = total_messages.saturating_sub(visible_message_count());
-    let visible_start = total_messages.saturating_sub(visible_message_count());
     let can_send = current_chat_id().is_some()
         && has_model
         && (!input_text().trim().is_empty() || !pending_attachments().is_empty())
@@ -1871,9 +1974,11 @@ pub fn ChatWindow(
             current_chat_id,
             input_text,
             messages,
+            message_count,
             current_cancel,
             loading_chat,
             send_to_ollama,
+            visible_message_count,
             settings,
             rag_status,
             mcp_status,
@@ -1886,7 +1991,10 @@ pub fn ChatWindow(
         move || {
             if let Some(chat_id) = current_chat_id() {
                 let text = input_text();
-                let history_snapshot = messages();
+                let history_snapshot = {
+                    let conn = init_db();
+                    load_chat_messages(&conn, &chat_id, MAX_HISTORY_MESSAGES)
+                };
                 let attachments = pending_attachments();
 
                 if text.trim().is_empty() && attachments.is_empty() {
@@ -1913,6 +2021,7 @@ pub fn ChatWindow(
                 enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
 
                 messages.push(("user".into(), stored_user_content.clone()));
+                message_count.set(message_count().saturating_add(1));
                 input_text.set("".to_string());
                 pending_attachments.set(Vec::new());
                 show_composer_tools.set(false);
@@ -1926,7 +2035,13 @@ pub fn ChatWindow(
                         mcp_last_error(),
                     ) {
                         persist_chat_message(&conn, &chat_id, "assistant", &local_reply);
-                        push_visible_message(current_chat_id, messages, &chat_id, "assistant", &local_reply);
+                        refresh_visible_chat_window(
+                            current_chat_id,
+                            messages,
+                            message_count,
+                            &chat_id,
+                            visible_message_count().max(MESSAGE_WINDOW_SIZE),
+                        );
                         push_toast(
                             toasts,
                             ToastKind::Info,
@@ -2042,11 +2157,19 @@ pub fn ChatWindow(
                 if hidden_message_count > 0 {
                     button {
                         class: "history-load-more",
-                        onclick: move |_| visible_message_count.set((visible_message_count() + 120).min(total_messages)),
+                        onclick: move |_| {
+                            if let Some(chat_id) = current_chat_id() {
+                                let next_limit = (visible_message_count() + 120).min(total_messages);
+                                let conn = init_db();
+                                messages.set(load_chat_messages(&conn, &chat_id, next_limit as i64));
+                                message_count.set(count_chat_messages(&conn, &chat_id) as usize);
+                                visible_message_count.set(next_limit);
+                            }
+                        },
                         "Load {hidden_message_count} older messages"
                     }
                 }
-                {messages().iter().skip(visible_start).map(|(role, content)| {
+                {messages().iter().map(|(role, content)| {
                     rsx! {
                         Message {
                             role: role.clone(),
@@ -2130,6 +2253,27 @@ pub fn ChatWindow(
 
                             button {
                                 class: "composer-tool-item",
+                                disabled: is_current_chat_loading,
+                                onclick: move |_| {
+                                    if let Some(path) = FileDialog::new().pick_folder() {
+                                        let attachment = make_attachment(&path);
+                                        let mut next = pending_attachments();
+                                        if !next.iter().any(|existing| existing.path == attachment.path) {
+                                            next.push(attachment);
+                                        }
+                                        pending_attachments.set(next);
+                                    }
+                                    show_composer_tools.set(false);
+                                },
+                                span { class: "composer-tool-icon", "⬚" }
+                                span { class: "composer-tool-copy",
+                                    strong { "Attach folder" }
+                                    small { "Share a folder directly in chat" }
+                                }
+                            }
+
+                            button {
+                                class: "composer-tool-item",
                                 disabled: is_indexing(),
                                 onclick: move |_| {
                                     if let Some(path) = FileDialog::new().pick_folder() {
@@ -2194,6 +2338,7 @@ pub fn ChatWindow(
                                                     }
                                                 }
                                                 Err(err) => {
+                                                    record_ui_error("rag", format!("Indexing failed: {err}"));
                                                     push_toast(
                                                         toasts,
                                                         ToastKind::Error,
@@ -2232,6 +2377,8 @@ pub fn ChatWindow(
                                             src: "{attachment_image_src(&attachment_path)}",
                                             alt: "{attachment_name}",
                                         }
+                                    } else if attachment_kind == AttachmentKind::Folder {
+                                        div { class: "input-attachment-file", "DIR" }
                                     } else {
                                         div { class: "input-attachment-file", "FILE" }
                                     }
@@ -2676,6 +2823,8 @@ fn AttachmentGallery(attachments: Vec<ChatAttachment>) -> Element {
                                 src: "{attachment_image_src(&path)}",
                                 alt: "{name}",
                             }
+                        } else if kind == AttachmentKind::Folder {
+                            div { class: "message-attachment-file-badge", "DIR" }
                         } else {
                             div { class: "message-attachment-file-badge", "FILE" }
                         }
