@@ -2,6 +2,8 @@
 
 RustyChat is a local-first desktop AI workspace built with Rust and Dioxus. It combines Ollama chat, vision-capable prompts, local RAG, inline code execution, and MCP integrations in a single desktop app with SQLite-backed persistence.
 
+This repository is the actively maintained continuation of the original RustyChat project by `KPCOFGS`. The original upstream was archived, so ongoing development continues here with attribution preserved.
+
 ## What It Does
 
 - Chats with local Ollama models through `/api/chat`
