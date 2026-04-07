@@ -1471,7 +1471,7 @@ pub fn Sidebar(
                 }
                 a {
                     class: "sidebar-icon-btn repo-icon",
-                    href: "https://github.com/KPCOFGS/RustyChat",
+                    href: "https://github.com/Djeylani/RustyChat",
                     target: "_blank",
                     title: "Open repository",
                     "↗"
