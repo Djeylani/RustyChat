@@ -4,12 +4,21 @@ use arboard::Clipboard;
 use crate::executor::{execute_code, ExecutionResult};
 
 #[component]
-pub fn Markdown(content: String) -> Element {
-    render_markdown(&content)
+pub fn Markdown(
+    content: String,
+    code_execution_enabled: bool,
+    execution_timeout_secs: i32,
+) -> Element {
+    render_markdown(&content, code_execution_enabled, execution_timeout_secs)
 }
 
 #[component]
-fn CodeBlock(language: String, content: String) -> Element {
+fn CodeBlock(
+    language: String,
+    content: String,
+    code_execution_enabled: bool,
+    execution_timeout_secs: i32,
+) -> Element {
     let mut copied = use_signal(|| false);
     let mut execution_result = use_signal(|| Option::<ExecutionResult>::None);
     let mut is_executing = use_signal(|| false);
@@ -32,12 +41,16 @@ fn CodeBlock(language: String, content: String) -> Element {
     let run_code = {
         to_owned![content, language];
         move |_| {
+            if !code_execution_enabled {
+                return;
+            }
             is_executing.set(true);
             execution_result.set(None);
             let content = content.clone();
             let language = language.clone();
+            let timeout_secs = execution_timeout_secs.max(3) as u64;
             spawn(async move {
-                let result = execute_code(&language, &content).await;
+                let result = execute_code(&language, &content, timeout_secs).await;
                 execution_result.set(Some(result));
                 is_executing.set(false);
             });
@@ -56,14 +69,30 @@ fn CodeBlock(language: String, content: String) -> Element {
                     }
                     button { 
                         class: "code-action-btn run-btn", 
-                        disabled: is_executing(),
+                        disabled: is_executing() || !code_execution_enabled,
                         onclick: run_code,
-                        if is_executing() { "⌛ Running..." } else { "▶ Run" }
+                        if is_executing() {
+                            "⌛ Running..."
+                        } else if code_execution_enabled {
+                            "▶ Run"
+                        } else {
+                            "🔒 Enable in Settings"
+                        }
                     }
                 }
             }
             pre { class: "code-block",
                 code { "{content}" }
+            }
+
+            if code_execution_enabled {
+                p { class: "code-run-note",
+                    "Runs in an isolated temp folder with a {execution_timeout_secs.max(3)}s timeout."
+                }
+            } else {
+                p { class: "code-run-note warning",
+                    "Code execution is disabled by default. Enable it in Settings to run generated snippets."
+                }
             }
             
             {if let Some(result) = execution_result() {
@@ -85,6 +114,7 @@ fn CodeBlock(language: String, content: String) -> Element {
                         }
                         div { class: "console-footer",
                             span { "Exit Code: {result.exit_code.unwrap_or(0)}" }
+                            span { "Working Dir: {result.working_directory}" }
                         }
                     }
                 }
@@ -95,7 +125,11 @@ fn CodeBlock(language: String, content: String) -> Element {
     }
 }
 
-fn render_markdown(content: &str) -> Element {
+fn render_markdown(
+    content: &str,
+    code_execution_enabled: bool,
+    execution_timeout_secs: i32,
+) -> Element {
     let parser = Parser::new(content);
     let mut stack: Vec<Vec<Element>> = vec![Vec::new()];
     
@@ -122,7 +156,9 @@ fn render_markdown(content: &str) -> Element {
                 parent_buffer.push(rsx!(
                     CodeBlock { 
                         language: current_code_lang.clone(), 
-                        content: current_code_content.clone() 
+                        content: current_code_content.clone(),
+                        code_execution_enabled,
+                        execution_timeout_secs,
                     }
                 ));
             }

@@ -1,4 +1,31 @@
 use rusqlite::{params, Connection, Row};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    Stdio,
+    Http,
+    Filesystem,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpKeyValue {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub name: String,
+    pub transport: McpTransport,
+    pub target: String,
+    pub auth_header_name: String,
+    pub auth_token: String,
+    pub custom_headers: Vec<McpKeyValue>,
+    pub env_vars: Vec<McpKeyValue>,
+}
 
 /* ================= DATABASE ================= */
 
@@ -7,7 +34,11 @@ pub struct Settings {
     pub model: String,
     pub embed_model: String,
     pub mcp_server_command: String,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub active_mcp_server_id: String,
     pub system_prompt: String,
+    pub allow_code_execution: bool,
+    pub execution_timeout_secs: i32,
     pub temperature: f64,
     pub top_p: f64,
     pub max_tokens: i32,
@@ -47,7 +78,11 @@ pub fn init_db() -> Connection {
             model TEXT NOT NULL,
             embed_model TEXT NOT NULL DEFAULT '',
             mcp_server_command TEXT NOT NULL DEFAULT '',
+            mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+            active_mcp_server_id TEXT NOT NULL DEFAULT '',
             system_prompt TEXT,
+            allow_code_execution INTEGER NOT NULL DEFAULT 0,
+            execution_timeout_secs INTEGER NOT NULL DEFAULT 12,
             temperature REAL,
             top_p REAL,
             max_tokens INTEGER,
@@ -66,6 +101,22 @@ pub fn init_db() -> Connection {
     );
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN mcp_server_command TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN mcp_servers_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN active_mcp_server_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN allow_code_execution INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN execution_timeout_secs INTEGER NOT NULL DEFAULT 12",
         [],
     );
 
@@ -88,13 +139,17 @@ pub fn init_db() -> Connection {
 
     if !exists {
         conn.execute(
-            "INSERT INTO settings (id, model, embed_model, mcp_server_command, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO settings (id, model, embed_model, mcp_server_command, mcp_servers_json, active_mcp_server_id, system_prompt, allow_code_execution, execution_timeout_secs, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 "", // no default model — user must pick one
                 "",
                 "",
+                "[]",
                 "",
+                "",
+                0_i32,
+                12_i32,
                 0.7_f64,
                 0.95_f64,
                 512_i32,
@@ -123,22 +178,46 @@ pub fn clamp_to_i32(v: i64) -> i32 {
 
 pub fn load_settings(conn: &Connection) -> Settings {
     conn.query_row(
-        "SELECT model, embed_model, mcp_server_command, system_prompt, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height FROM settings WHERE id = 1",
+        "SELECT model, embed_model, mcp_server_command, mcp_servers_json, active_mcp_server_id, system_prompt, allow_code_execution, execution_timeout_secs, temperature, top_p, max_tokens, zoom, maximized, window_width, window_height FROM settings WHERE id = 1",
         [],
         |row: &Row| {
+            let legacy_mcp_command = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let parsed_servers = row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "[]".to_string());
+            let mut mcp_servers = serde_json::from_str::<Vec<McpServerConfig>>(&parsed_servers)
+                .unwrap_or_default();
+            if mcp_servers.is_empty() && !legacy_mcp_command.trim().is_empty() {
+                mcp_servers.push(legacy_mcp_server(&legacy_mcp_command));
+            }
+
+            let active_mcp_server_id = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let active_mcp_server_id = if !active_mcp_server_id.is_empty()
+                && mcp_servers.iter().any(|server| server.id == active_mcp_server_id)
+            {
+                active_mcp_server_id
+            } else {
+                mcp_servers
+                    .first()
+                    .map(|server| server.id.clone())
+                    .unwrap_or_default()
+            };
+
             Ok(Settings {
                 model: row.get::<_, String>(0)?,
                 embed_model: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                mcp_server_command: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                system_prompt: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                temperature: row.get::<_, Option<f64>>(4)?.unwrap_or(0.7),
-                top_p: row.get::<_, Option<f64>>(5)?.unwrap_or(0.95),
-                max_tokens: clamp_to_i32(row.get::<_, Option<i64>>(6)?.unwrap_or(512)),
-                zoom: clamp_to_i32(row.get::<_, Option<i64>>(7)?.unwrap_or(100)),
+                mcp_server_command: legacy_mcp_command,
+                mcp_servers,
+                active_mcp_server_id,
+                system_prompt: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                allow_code_execution: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                execution_timeout_secs: clamp_to_i32(row.get::<_, Option<i64>>(7)?.unwrap_or(12)),
+                temperature: row.get::<_, Option<f64>>(8)?.unwrap_or(0.7),
+                top_p: row.get::<_, Option<f64>>(9)?.unwrap_or(0.95),
+                max_tokens: clamp_to_i32(row.get::<_, Option<i64>>(10)?.unwrap_or(512)),
+                zoom: clamp_to_i32(row.get::<_, Option<i64>>(11)?.unwrap_or(100)),
                 // always treat maximized as true on start (we still read DB value for compatibility)
                 maximized: true,
-                window_width: clamp_to_i32(row.get::<_, Option<i64>>(9)?.unwrap_or(1024)),
-                window_height: clamp_to_i32(row.get::<_, Option<i64>>(10)?.unwrap_or(768)),
+                window_width: clamp_to_i32(row.get::<_, Option<i64>>(13)?.unwrap_or(1024)),
+                window_height: clamp_to_i32(row.get::<_, Option<i64>>(14)?.unwrap_or(768)),
             })
         },
     )
@@ -147,18 +226,29 @@ pub fn load_settings(conn: &Connection) -> Settings {
 
 pub fn save_settings(conn: &Connection, s: &Settings) {
     // ensure fields are within i32 bounds
+    let execution_timeout_secs = s.execution_timeout_secs.clamp(3, 120);
     let max_tokens: i64 = s.max_tokens.into();
     let zoom: i64 = s.zoom.into();
     let width: i64 = s.window_width.into();
     let height: i64 = s.window_height.into();
+    let active_server = s.active_mcp_server();
+    let legacy_command = active_server
+        .as_ref()
+        .map(|server| server.target.clone())
+        .unwrap_or_default();
+    let mcp_servers_json = serde_json::to_string(&s.mcp_servers).unwrap_or_else(|_| "[]".to_string());
 
     conn.execute(
-        "UPDATE settings SET model = ?1, embed_model = ?2, mcp_server_command = ?3, system_prompt = ?4, temperature = ?5, top_p = ?6, max_tokens = ?7, zoom = ?8, maximized = ?9, window_width = ?10, window_height = ?11 WHERE id = 1",
+        "UPDATE settings SET model = ?1, embed_model = ?2, mcp_server_command = ?3, mcp_servers_json = ?4, active_mcp_server_id = ?5, system_prompt = ?6, allow_code_execution = ?7, execution_timeout_secs = ?8, temperature = ?9, top_p = ?10, max_tokens = ?11, zoom = ?12, maximized = ?13, window_width = ?14, window_height = ?15 WHERE id = 1",
         params![
             s.model,
             s.embed_model,
-            s.mcp_server_command,
+            legacy_command,
+            mcp_servers_json,
+            s.active_mcp_server_id,
             s.system_prompt,
+            if s.allow_code_execution { 1 } else { 0 },
+            execution_timeout_secs,
             s.temperature,
             s.top_p,
             clamp_to_i32(max_tokens),
@@ -169,6 +259,38 @@ pub fn save_settings(conn: &Connection, s: &Settings) {
         ],
     )
     .unwrap();
+}
+
+impl Settings {
+    pub fn active_mcp_server(&self) -> Option<McpServerConfig> {
+        self.mcp_servers
+            .iter()
+            .find(|server| server.id == self.active_mcp_server_id)
+            .cloned()
+            .or_else(|| self.mcp_servers.first().cloned())
+    }
+}
+
+fn legacy_mcp_server(command: &str) -> McpServerConfig {
+    let trimmed = command.trim();
+    let transport = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        McpTransport::Http
+    } else if std::path::Path::new(trimmed).is_dir() {
+        McpTransport::Filesystem
+    } else {
+        McpTransport::Stdio
+    };
+
+    McpServerConfig {
+        id: "legacy-default".to_string(),
+        name: "Legacy MCP".to_string(),
+        transport,
+        target: trimmed.to_string(),
+        auth_header_name: String::new(),
+        auth_token: String::new(),
+        custom_headers: Vec::new(),
+        env_vars: Vec::new(),
+    }
 }
 
 pub fn clear_document_chunks(conn: &Connection) -> usize {

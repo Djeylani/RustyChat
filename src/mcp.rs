@@ -1,23 +1,25 @@
+use crate::db::{McpServerConfig, McpTransport};
 use serde_json::{json, Value};
-use std::path::Path;
 use std::io::ErrorKind;
+use std::path::Path;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
-pub async fn handle_mcp_command(server_command: &str, user_input: &str) -> Result<String, String> {
-    if server_command.trim().is_empty() {
-        return Err("No MCP server command configured. Add one in Settings first.".to_string());
+pub async fn handle_mcp_command(server: &McpServerConfig, user_input: &str) -> Result<String, String> {
+    if server.target.trim().is_empty() {
+        return Err("No active MCP server is configured. Add one in Settings first.".to_string());
     }
 
     let request = parse_user_command(user_input)?;
-    if is_http_endpoint(server_command) {
-        return handle_http_command(server_command.trim(), request).await;
+    if matches!(server.transport, McpTransport::Http) {
+        return handle_http_command(server, request).await;
     }
 
-    let (program, args) = resolve_server_command(server_command)?;
+    let (program, args) = resolve_server_command(server)?;
     let mut child = Command::new(program)
         .args(args)
+        .envs(server.env_vars.iter().map(|entry| (entry.key.as_str(), entry.value.as_str())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -152,43 +154,46 @@ fn split_command_line(command: &str) -> Result<(String, Vec<String>), String> {
     Ok((parts.remove(0), parts))
 }
 
-fn is_http_endpoint(command: &str) -> bool {
-    let trimmed = command.trim();
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
-fn resolve_server_command(command: &str) -> Result<(String, Vec<String>), String> {
-    let trimmed = command.trim();
+fn resolve_server_command(server: &McpServerConfig) -> Result<(String, Vec<String>), String> {
+    let trimmed = server.target.trim();
     if trimmed.is_empty() {
         return Err("MCP server command is empty.".to_string());
     }
 
-    let path = Path::new(trimmed);
-    if path.exists() && path.is_dir() {
-        #[cfg(target_os = "windows")]
-        let launcher = "npx.cmd".to_string();
-        #[cfg(not(target_os = "windows"))]
-        let launcher = "npx".to_string();
+    match server.transport {
+        McpTransport::Filesystem => {
+            let path = Path::new(trimmed);
+            if !path.exists() || !path.is_dir() {
+                return Err("Filesystem MCP target must point to an existing folder.".to_string());
+            }
 
-        return Ok((
-            launcher,
-            vec![
-                "-y".to_string(),
-                "@modelcontextprotocol/server-filesystem".to_string(),
-                trimmed.to_string(),
-            ],
-        ));
+            #[cfg(target_os = "windows")]
+            let launcher = "npx.cmd".to_string();
+            #[cfg(not(target_os = "windows"))]
+            let launcher = "npx".to_string();
+
+            Ok((
+                launcher,
+                vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    trimmed.to_string(),
+                ],
+            ))
+        }
+        McpTransport::Stdio => split_command_line(trimmed),
+        McpTransport::Http => Err("HTTP MCP integrations should not be launched as stdio commands.".to_string()),
     }
-
-    split_command_line(trimmed)
 }
 
-async fn handle_http_command(server_url: &str, request: ParsedMcpCommand) -> Result<String, String> {
+async fn handle_http_command(server: &McpServerConfig, request: ParsedMcpCommand) -> Result<String, String> {
     let client = reqwest::Client::new();
     let mut session_id: Option<String> = None;
+    let server_url = server.target.trim();
 
     let init_response = send_http_message(
         &client,
+        server,
         server_url,
         &json!({
             "jsonrpc": "2.0",
@@ -216,6 +221,7 @@ async fn handle_http_command(server_url: &str, request: ParsedMcpCommand) -> Res
 
     let _ = send_http_message(
         &client,
+        server,
         server_url,
         &json!({
             "jsonrpc": "2.0",
@@ -230,6 +236,7 @@ async fn handle_http_command(server_url: &str, request: ParsedMcpCommand) -> Res
         ParsedMcpCommand::ToolsList => {
             let response = send_http_message(
                 &client,
+                server,
                 server_url,
                 &json!({
                     "jsonrpc": "2.0",
@@ -245,6 +252,7 @@ async fn handle_http_command(server_url: &str, request: ParsedMcpCommand) -> Res
         ParsedMcpCommand::ToolsCall { name, arguments } => {
             let response = send_http_message(
                 &client,
+                server,
                 server_url,
                 &json!({
                     "jsonrpc": "2.0",
@@ -528,6 +536,7 @@ fn format_file_info(value: &Value) -> Option<String> {
 
 async fn send_http_message(
     client: &reqwest::Client,
+    server: &McpServerConfig,
     server_url: &str,
     payload: &Value,
     session_id: Option<&str>,
@@ -542,6 +551,23 @@ async fn send_http_message(
             HeaderName::from_static("mcp-session-id"),
             HeaderValue::from_str(session_id).map_err(|e| format!("Invalid MCP session id: {e}"))?,
         );
+    }
+    if !server.auth_header_name.trim().is_empty() && !server.auth_token.trim().is_empty() {
+        let header_name = HeaderName::from_bytes(server.auth_header_name.trim().as_bytes())
+            .map_err(|e| format!("Invalid auth header name: {e}"))?;
+        let header_value = HeaderValue::from_str(server.auth_token.trim())
+            .map_err(|e| format!("Invalid auth header value: {e}"))?;
+        headers.insert(header_name, header_value);
+    }
+    for entry in &server.custom_headers {
+        if entry.key.trim().is_empty() {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(entry.key.trim().as_bytes())
+            .map_err(|e| format!("Invalid custom header name `{}`: {e}", entry.key))?;
+        let header_value = HeaderValue::from_str(entry.value.trim())
+            .map_err(|e| format!("Invalid custom header value for `{}`: {e}", entry.key))?;
+        headers.insert(header_name, header_value);
     }
 
     let response = client

@@ -4169,6 +4169,7 @@ name = "rusty-chat"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64",
  "bincode",
  "dioxus",
  "futures-util",

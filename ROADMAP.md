@@ -33,10 +33,10 @@ This document tracks the transformation of RustyChat from a primitive Ollama wra
 - [ ] **Folder Sharing:** Let users attach folders directly into chat flows, not only RAG indexing.
 - [x] **Image Sharing:** Support image attachment/upload in chat and render image messages cleanly.
 - [x] **Multimodal Pipeline:** Pass attached images to Ollama chat requests for vision-capable models.
-- [ ] **MCP Integrations UX:** Support multiple MCP integrations with structured config, auth/env fields, and validation.
-- [ ] **Tool-Friendly Results:** Add richer result views for common MCP/file operations instead of raw text-first outputs.
-- [ ] **Execution Safety:** Add sandboxing or a safer execution boundary for the inline code runner.
-- [ ] **Long-History Performance:** Add virtualization or equivalent rendering strategy for very large chats.
+- [x] **MCP Integrations UX:** Support multiple MCP integrations with structured config, auth/env fields, active switching, and validation.
+- [x] **Tool-Friendly Results:** Add richer result views for common MCP/file operations instead of raw text-first outputs.
+- [x] **Execution Safety:** Add an opt-in inline runner with temp-folder isolation, timeouts, and output caps.
+- [x] **Long-History Performance:** Limit the initial render window for large chats and let users load older messages on demand.
 
 ---
-*Status: ⚙️ Phases 1-3 complete. Phase 4 is in progress, with attachments, vision wiring, and shared notifications started; remaining work focuses on hardening, scalability, and safer tool execution.*
+*Status: ✅ Phases 1-4 complete. RustyChat now includes attachments, vision support, shared notifications, safer code execution, multi-server MCP UX, richer MCP result views, and on-demand loading for long chat histories.*

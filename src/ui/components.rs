@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use reqwest::Client;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -14,7 +14,7 @@ use rfd::FileDialog;
 
 use crate::db::{
     clear_document_chunks, count_document_chunks, count_indexed_files, enforce_history_limit,
-    init_db, save_settings, Settings, clamp_to_i32,
+    init_db, save_settings, Settings, clamp_to_i32, McpKeyValue, McpServerConfig, McpTransport,
 };
 use crate::mcp::handle_mcp_command;
 use crate::ollama::{OllamaChatRequest, OllamaChatResponse, OllamaMessage};
@@ -278,6 +278,43 @@ fn push_toast(
     });
 }
 
+fn persist_chat_message(conn: &Connection, chat_id: &str, role: &str, content: &str) {
+    let _ = conn.execute(
+        "INSERT INTO messages (chat_id, role, content) VALUES (?1, ?2, ?3)",
+        params![chat_id, role, content],
+    );
+    enforce_history_limit(conn, chat_id, MAX_HISTORY_MESSAGES);
+}
+
+fn push_visible_message(
+    current_chat_id: Signal<Option<String>>,
+    mut messages: Signal<Vec<(String, String)>>,
+    chat_id: &str,
+    role: &str,
+    content: &str,
+) {
+    if current_chat_id()
+        .as_ref()
+        .map(|current| current == chat_id)
+        .unwrap_or(false)
+    {
+        messages.push((role.to_string(), content.to_string()));
+    }
+}
+
+fn persist_and_push_message(
+    current_chat_id: Signal<Option<String>>,
+    messages: Signal<Vec<(String, String)>>,
+    chat_id: &str,
+    role: &str,
+    content: impl Into<String>,
+) {
+    let content = content.into();
+    let conn = init_db();
+    persist_chat_message(&conn, chat_id, role, &content);
+    push_visible_message(current_chat_id, messages, chat_id, role, &content);
+}
+
 fn parse_mcp_tools_listing(listing: &str) -> Vec<(String, String)> {
     listing
         .lines()
@@ -394,6 +431,131 @@ C:\Users\tella\Documents\AI-Terminal\mcp\notes"#
     }
 }
 
+fn parse_mcp_tools_message(content: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = content.trim();
+    let body = trimmed.strip_prefix("Available MCP tools:")?.trim();
+    let mut tools = Vec::new();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let entry = line.strip_prefix("- ")?;
+        if let Some((name, description)) = entry.split_once(':') {
+            tools.push((name.trim().to_string(), description.trim().to_string()));
+        } else {
+            tools.push((entry.trim().to_string(), String::new()));
+        }
+    }
+    if tools.is_empty() { None } else { Some(tools) }
+}
+
+fn parse_mcp_file_rows(content: &str) -> Option<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let entry = line.strip_prefix("- ")?;
+        if let Some(name) = entry.strip_prefix("`DIR` ") {
+            rows.push(("DIR".to_string(), name.trim().to_string()));
+        } else if let Some(name) = entry.strip_prefix("`FILE` ") {
+            rows.push(("FILE".to_string(), name.trim().to_string()));
+        } else {
+            return None;
+        }
+    }
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+fn parse_mcp_info_rows(content: &str) -> Option<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let entry = line.strip_prefix("- **")?;
+        let (key, value) = entry.split_once("**: ")?;
+        rows.push((key.trim().to_string(), value.trim().to_string()));
+    }
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+fn serialize_mcp_pairs(entries: &[McpKeyValue]) -> String {
+    entries
+        .iter()
+        .filter(|entry| !entry.key.trim().is_empty())
+        .map(|entry| format!("{}={}", entry.key, entry.value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_mcp_pairs(input: &str, label: &str) -> Result<Vec<McpKeyValue>, String> {
+    let mut entries = Vec::new();
+    for (idx, line) in input.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = match trimmed.split_once('=') {
+            Some((key, value)) => (key.trim(), value.trim()),
+            None => (trimmed, ""),
+        };
+        if key.is_empty() {
+            return Err(format!("{label} line {} is missing a key.", idx + 1));
+        }
+        if !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return Err(format!(
+                "{label} key `{key}` contains unsupported characters."
+            ));
+        }
+        entries.push(McpKeyValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn validate_mcp_server(server: &McpServerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    if server.name.trim().is_empty() {
+        errors.push("Server name is required.".to_string());
+    }
+    if server.target.trim().is_empty() {
+        errors.push("Connection target is required.".to_string());
+    }
+
+    match server.transport {
+        McpTransport::Http => {
+            if !server.target.starts_with("http://") && !server.target.starts_with("https://") {
+                errors.push("HTTP transport requires an http:// or https:// URL.".to_string());
+            }
+        }
+        McpTransport::Filesystem => {
+            if server.target.contains("http://") || server.target.contains("https://") {
+                errors.push("Filesystem transport expects a folder path, not a URL.".to_string());
+            }
+        }
+        McpTransport::Stdio => {}
+    }
+
+    if server.auth_header_name.trim().is_empty() ^ server.auth_token.trim().is_empty() {
+        errors.push("Auth header name and auth token must either both be set or both be empty.".to_string());
+    }
+
+    errors
+}
+
+fn transport_label(transport: &McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "StdIO",
+        McpTransport::Http => "HTTP",
+        McpTransport::Filesystem => "Filesystem",
+    }
+}
+
+fn mcp_target_placeholder(transport: &McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "npx -y @modelcontextprotocol/server-filesystem C:\\path",
+        McpTransport::Http => "https://your-mcp-server.example.com/mcp",
+        McpTransport::Filesystem => "C:\\Users\\tella\\Documents\\project",
+    }
+}
+
 /* ================= SETTINGS MODAL ================= */
 
 #[component]
@@ -408,8 +570,12 @@ pub fn SettingsModal(
     // local editable copies using signals
     let mut local_model = use_signal(|| settings().model.clone());
     let mut local_embed_model = use_signal(|| settings().embed_model.clone());
-    let mut local_mcp_server_command = use_signal(|| settings().mcp_server_command.clone());
+    let mut local_mcp_servers = use_signal(|| settings().mcp_servers.clone());
+    let mut local_active_mcp_server_id = use_signal(|| settings().active_mcp_server_id.clone());
+    let mut local_selected_mcp_server_id = use_signal(|| settings().active_mcp_server_id.clone());
     let mut local_system = use_signal(|| settings().system_prompt.clone());
+    let mut local_allow_code_execution = use_signal(|| settings().allow_code_execution);
+    let mut local_execution_timeout_secs = use_signal(|| settings().execution_timeout_secs);
     let mut local_temp = use_signal(|| settings().temperature);
     let mut local_top_p = use_signal(|| settings().top_p);
     let mut local_max_tokens = use_signal(|| settings().max_tokens);
@@ -468,8 +634,12 @@ pub fn SettingsModal(
         let settings_sig = settings.clone();
         let mut local_model_sig = local_model.clone();
         let mut local_embed_model_sig = local_embed_model.clone();
-        let mut local_mcp_server_command_sig = local_mcp_server_command.clone();
+        let mut local_mcp_servers_sig = local_mcp_servers.clone();
+        let mut local_active_mcp_server_id_sig = local_active_mcp_server_id.clone();
+        let mut local_selected_mcp_server_id_sig = local_selected_mcp_server_id.clone();
         let mut local_system_sig = local_system.clone();
+        let mut local_allow_code_execution_sig = local_allow_code_execution.clone();
+        let mut local_execution_timeout_secs_sig = local_execution_timeout_secs.clone();
         let mut local_temp_sig = local_temp.clone();
         let mut local_top_p_sig = local_top_p.clone();
         let mut local_max_tokens_sig = local_max_tokens.clone();
@@ -481,8 +651,12 @@ pub fn SettingsModal(
                 let s = settings_sig();
                 local_model_sig.set(s.model.clone());
                 local_embed_model_sig.set(s.embed_model.clone());
-                local_mcp_server_command_sig.set(s.mcp_server_command.clone());
+                local_mcp_servers_sig.set(s.mcp_servers.clone());
+                local_active_mcp_server_id_sig.set(s.active_mcp_server_id.clone());
+                local_selected_mcp_server_id_sig.set(s.active_mcp_server_id.clone());
                 local_system_sig.set(s.system_prompt.clone());
+                local_allow_code_execution_sig.set(s.allow_code_execution);
+                local_execution_timeout_secs_sig.set(s.execution_timeout_secs);
                 local_temp_sig.set(s.temperature);
                 local_top_p_sig.set(s.top_p);
                 local_max_tokens_sig.set(s.max_tokens);
@@ -507,8 +681,11 @@ pub fn SettingsModal(
         to_owned![
             local_model,
             local_embed_model,
-            local_mcp_server_command,
+            local_mcp_servers,
+            local_active_mcp_server_id,
             local_system,
+            local_allow_code_execution,
+            local_execution_timeout_secs,
             local_temp,
             local_top_p,
             local_max_tokens,
@@ -523,13 +700,36 @@ pub fn SettingsModal(
             model_str = model_str.trim().to_string();
             let mut embed_model_str = local_embed_model().clone();
             embed_model_str = embed_model_str.trim().to_string();
-            let mcp_server_command_str = local_mcp_server_command().trim().to_string();
+            let mut mcp_servers = local_mcp_servers();
+            for server in &mut mcp_servers {
+                server.name = server.name.trim().to_string();
+                server.target = server.target.trim().to_string();
+                server.auth_header_name = server.auth_header_name.trim().to_string();
+                server.auth_token = server.auth_token.trim().to_string();
+                server.custom_headers.retain(|entry| !entry.key.trim().is_empty());
+                server.env_vars.retain(|entry| !entry.key.trim().is_empty());
+            }
+            let active_mcp_server_id = if mcp_servers
+                .iter()
+                .any(|server| server.id == local_active_mcp_server_id())
+            {
+                local_active_mcp_server_id()
+            } else {
+                mcp_servers
+                    .first()
+                    .map(|server| server.id.clone())
+                    .unwrap_or_default()
+            };
 
             let new_settings = Settings {
                 model: model_str,
                 embed_model: embed_model_str,
-                mcp_server_command: mcp_server_command_str,
+                mcp_server_command: String::new(),
+                mcp_servers,
+                active_mcp_server_id,
                 system_prompt: local_system().clone(),
+                allow_code_execution: local_allow_code_execution(),
+                execution_timeout_secs: local_execution_timeout_secs().clamp(3, 120),
                 temperature: local_temp(),
                 top_p: local_top_p(),
                 max_tokens: clamp_to_i32(local_max_tokens().into()),
@@ -572,6 +772,29 @@ pub fn SettingsModal(
         }
     };
 
+    let selected_server_id = local_selected_mcp_server_id();
+    let selected_server = local_mcp_servers()
+        .iter()
+        .find(|server| server.id == selected_server_id)
+        .cloned()
+        .or_else(|| local_mcp_servers().first().cloned());
+    let selected_server_errors = selected_server
+        .as_ref()
+        .map(validate_mcp_server)
+        .unwrap_or_default();
+    let mut name_counts = std::collections::HashMap::<String, usize>::new();
+    for server in local_mcp_servers() {
+        let key = server.name.trim().to_lowercase();
+        if !key.is_empty() {
+            *name_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let has_duplicate_names = name_counts.values().any(|count| *count > 1);
+    let has_mcp_validation_errors = has_duplicate_names
+        || local_mcp_servers()
+            .iter()
+            .any(|server| !validate_mcp_server(server).is_empty());
+
     rsx! {
         div { class: "settings-overlay",
             div { class: "settings-modal",
@@ -603,20 +826,301 @@ pub fn SettingsModal(
                     p { class: "dim-text warning-text", "No embedding model selected - chat will still work, but RAG indexing and retrieval stay disabled." }
                 }
 
-                label { "MCP server command (optional)" }
-                input {
-                    class: "input",
-                    value: "{local_mcp_server_command}",
-                    placeholder: "Folder path, MCP HTTP URL, or full MCP server command",
-                    oninput: move |e| local_mcp_server_command.set(e.value()),
+                label { "MCP integrations" }
+                div { class: "mcp-settings-shell",
+                    div { class: "mcp-server-list",
+                        div { class: "mcp-settings-toolbar",
+                            p { class: "dim-text warning-text", "Save multiple MCP integrations, choose an active one, and add auth headers or env vars without keeping everything in one raw command string." }
+                            button {
+                                class: "secondary-action-btn",
+                                onclick: move |_| {
+                                    let id = Uuid::new_v4().to_string();
+                                    let next = McpServerConfig {
+                                        id: id.clone(),
+                                        name: format!("MCP Server {}", local_mcp_servers().len() + 1),
+                                        transport: McpTransport::Filesystem,
+                                        target: String::new(),
+                                        auth_header_name: String::new(),
+                                        auth_token: String::new(),
+                                        custom_headers: Vec::new(),
+                                        env_vars: Vec::new(),
+                                    };
+                                    let mut servers = local_mcp_servers();
+                                    servers.push(next);
+                                    local_mcp_servers.set(servers);
+                                    local_active_mcp_server_id.set(id.clone());
+                                    local_selected_mcp_server_id.set(id);
+                                },
+                                "Add MCP Server"
+                            }
+                        }
+
+                        if local_mcp_servers().is_empty() {
+                            div { class: "mcp-server-empty",
+                                strong { "No MCP integrations yet" }
+                                p { "Add one for filesystem browsing, stdio commands, or HTTP endpoints." }
+                            }
+                        } else {
+                            {local_mcp_servers().iter().map(|server| {
+                                let server_id = server.id.clone();
+                                let is_selected = selected_server_id == server.id;
+                                let is_active = local_active_mcp_server_id() == server.id;
+                                let duplicate_name = !server.name.trim().is_empty()
+                                    && name_counts
+                                        .get(&server.name.trim().to_lowercase())
+                                        .copied()
+                                        .unwrap_or(0) > 1;
+                                rsx!(
+                                    div {
+                                        class: if is_selected { "mcp-server-card selected" } else { "mcp-server-card" },
+                                        onclick: {
+                                            let server_id = server_id.clone();
+                                            move |_| local_selected_mcp_server_id.set(server_id.clone())
+                                        },
+                                        div { class: "mcp-server-card-top",
+                                            strong { "{server.name}" }
+                                            span { class: "mcp-server-transport", "{transport_label(&server.transport)}" }
+                                        }
+                                        p { class: "mcp-server-target", "{server.target}" }
+                                        div { class: "mcp-server-card-bottom",
+                                            if is_active {
+                                                span { class: "mcp-server-badge active", "Active" }
+                                            }
+                                            if duplicate_name {
+                                                span { class: "mcp-server-badge warning", "Duplicate name" }
+                                            }
+                                            button {
+                                                class: "mcp-server-remove",
+                                                onclick: {
+                                                    let server_id = server_id.clone();
+                                                    move |evt| {
+                                                    evt.stop_propagation();
+                                                    let remaining: Vec<McpServerConfig> = local_mcp_servers()
+                                                        .into_iter()
+                                                        .filter(|item| item.id != server_id)
+                                                        .collect();
+                                                    let next_active = if local_active_mcp_server_id() == server_id {
+                                                        remaining.first().map(|item| item.id.clone()).unwrap_or_default()
+                                                    } else {
+                                                        local_active_mcp_server_id()
+                                                    };
+                                                    let next_selected = remaining.first().map(|item| item.id.clone()).unwrap_or_default();
+                                                    local_mcp_servers.set(remaining);
+                                                    local_active_mcp_server_id.set(next_active);
+                                                    local_selected_mcp_server_id.set(next_selected);
+                                                    }
+                                                },
+                                                "Remove"
+                                            }
+                                        }
+                                    }
+                                )
+                            })}
+                        }
+                    }
+
+                    if let Some(server) = selected_server {
+                        div { class: "mcp-server-editor",
+                            label { "Server name" }
+                            input {
+                                class: "input",
+                                value: "{server.name}",
+                                oninput: {
+                                    let server_id = server.id.clone();
+                                    move |e| {
+                                    let mut servers = local_mcp_servers();
+                                    if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                        item.name = e.value();
+                                    }
+                                    local_mcp_servers.set(servers);
+                                    }
+                                },
+                            }
+
+                            label { "Transport" }
+                            select {
+                                class: "input",
+                                value: if matches!(server.transport, McpTransport::Stdio) {
+                                    "stdio"
+                                } else if matches!(server.transport, McpTransport::Http) {
+                                    "http"
+                                } else {
+                                    "filesystem"
+                                },
+                                onchange: {
+                                    let server_id = server.id.clone();
+                                    move |e| {
+                                    let mut servers = local_mcp_servers();
+                                    if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                        item.transport = match e.value().as_str() {
+                                            "http" => McpTransport::Http,
+                                            "filesystem" => McpTransport::Filesystem,
+                                            _ => McpTransport::Stdio,
+                                        };
+                                    }
+                                    local_mcp_servers.set(servers);
+                                    }
+                                },
+                                option { value: "filesystem", "Filesystem" }
+                                option { value: "stdio", "StdIO command" }
+                                option { value: "http", "HTTP endpoint" }
+                            }
+
+                            label { "Connection target" }
+                            input {
+                                class: "input",
+                                value: "{server.target}",
+                                placeholder: "{mcp_target_placeholder(&server.transport)}",
+                                oninput: {
+                                    let server_id = server.id.clone();
+                                    move |e| {
+                                    let mut servers = local_mcp_servers();
+                                    if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                        item.target = e.value();
+                                    }
+                                    local_mcp_servers.set(servers);
+                                    }
+                                },
+                            }
+
+                            div { class: "mcp-editor-grid",
+                                div {
+                                    label { "Auth header name" }
+                                    input {
+                                        class: "input",
+                                        value: "{server.auth_header_name}",
+                                        placeholder: "Authorization",
+                                        oninput: {
+                                            let server_id = server.id.clone();
+                                            move |e| {
+                                            let mut servers = local_mcp_servers();
+                                            if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                                item.auth_header_name = e.value();
+                                            }
+                                            local_mcp_servers.set(servers);
+                                            }
+                                        },
+                                    }
+                                }
+                                div {
+                                    label { "Auth token / value" }
+                                    input {
+                                        class: "input",
+                                        value: "{server.auth_token}",
+                                        placeholder: "Bearer <token>",
+                                        oninput: {
+                                            let server_id = server.id.clone();
+                                            move |e| {
+                                            let mut servers = local_mcp_servers();
+                                            if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                                item.auth_token = e.value();
+                                            }
+                                            local_mcp_servers.set(servers);
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+
+                            label { "Custom headers" }
+                            textarea {
+                                class: "textarea",
+                                value: "{serialize_mcp_pairs(&server.custom_headers)}",
+                                placeholder: "X-Org-Id=acme\nX-Workspace=dev",
+                                oninput: {
+                                    let server_id = server.id.clone();
+                                    move |e| {
+                                    if let Ok(parsed) = parse_mcp_pairs(&e.value(), "Custom header") {
+                                        let mut servers = local_mcp_servers();
+                                        if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                            item.custom_headers = parsed;
+                                        }
+                                        local_mcp_servers.set(servers);
+                                    }
+                                    }
+                                },
+                            }
+
+                            label { "Environment variables" }
+                            textarea {
+                                class: "textarea",
+                                value: "{serialize_mcp_pairs(&server.env_vars)}",
+                                placeholder: "API_KEY=...\nWORKSPACE_ROOT=C:\\project",
+                                oninput: {
+                                    let server_id = server.id.clone();
+                                    move |e| {
+                                    if let Ok(parsed) = parse_mcp_pairs(&e.value(), "Environment variable") {
+                                        let mut servers = local_mcp_servers();
+                                        if let Some(item) = servers.iter_mut().find(|item| item.id == server_id) {
+                                            item.env_vars = parsed;
+                                        }
+                                        local_mcp_servers.set(servers);
+                                    }
+                                    }
+                                },
+                            }
+
+                            div { class: "mcp-server-editor-footer",
+                                button {
+                                    class: if local_active_mcp_server_id() == server.id { "settings-toggle active" } else { "settings-toggle" },
+                                    onclick: {
+                                        let server_id = server.id.clone();
+                                        move |_| local_active_mcp_server_id.set(server_id.clone())
+                                    },
+                                    if local_active_mcp_server_id() == server.id { "Active integration" } else { "Make active" }
+                                }
+                                p { class: "dim-text warning-text",
+                                    match server.transport {
+                                        McpTransport::Filesystem => "Filesystem mode launches the MCP filesystem server against the selected folder.",
+                                        McpTransport::Stdio => "StdIO mode launches the command directly and passes env vars into that process.",
+                                        McpTransport::Http => "HTTP mode calls the MCP endpoint directly and attaches your auth or custom headers.",
+                                    }
+                                }
+                            }
+
+                            if has_duplicate_names {
+                                p { class: "dim-text warning-text", "Each MCP integration should have a distinct name so the active selection is clear." }
+                            }
+                            {selected_server_errors.iter().map(|error| rsx!(
+                                p { class: "dim-text warning-text", "{error}" }
+                            ))}
+                        }
+                    } else {
+                        div { class: "mcp-server-editor empty",
+                            p { "Select an MCP integration to edit it." }
+                        }
+                    }
                 }
-                p { class: "dim-text warning-text", "You can paste a folder path for the filesystem MCP server, an MCP HTTP endpoint URL, or a full stdio MCP command. Then use `/mcp tools` or `/mcp call <tool> {{json}}` in chat." }
 
                 label { "System prompt (optional)" }
                 textarea {
                     class: "textarea",
                     value: "{local_system}",
                     oninput: move |e| local_system.set(e.value()),
+                }
+
+                label { "Inline code execution" }
+                div { class: "settings-toggle-row",
+                    button {
+                        class: if local_allow_code_execution() { "settings-toggle active" } else { "settings-toggle" },
+                        onclick: move |_| local_allow_code_execution.set(!local_allow_code_execution()),
+                        if local_allow_code_execution() { "Enabled" } else { "Disabled" }
+                    }
+                    p { class: "dim-text warning-text", "Generated code runs locally on your machine. RustyChat now uses a temp working folder and timeout, but this is still not a full sandbox." }
+                }
+
+                label { "Execution timeout (seconds)" }
+                input {
+                    class: "input",
+                    r#type: "number",
+                    step: "1",
+                    min: "3",
+                    max: "120",
+                    value: "{local_execution_timeout_secs}",
+                    oninput: move |e| {
+                        let parsed = e.value().parse::<i32>().unwrap_or(12);
+                        local_execution_timeout_secs.set(parsed.clamp(3, 120));
+                    }
                 }
 
                 label { "Temperature" }
@@ -664,7 +1168,7 @@ pub fn SettingsModal(
 
                 div { class: "modal-actions",
                     button { onclick: delete_all, class: "delete-all", "Delete All History" }
-                    button { onclick: apply, "Apply" }
+                    button { onclick: apply, disabled: has_mcp_validation_errors, "Apply" }
                     button { onclick: cancel, "Cancel" }
                 }
             }
@@ -925,6 +1429,7 @@ pub fn ChatWindow(
     let mut selected_mcp_tool = use_signal(|| "".to_string());
     let mut mcp_tool_args = use_signal(|| "".to_string());
     let mut show_mcp_workspace = use_signal(|| false);
+    let mut visible_message_count = use_signal(|| 160_usize);
     let indexed_chunks = use_signal(|| count_document_chunks(&init_db()));
     let indexed_files = use_signal(|| count_indexed_files(&init_db()));
     let http_client = use_signal(|| Client::new());
@@ -946,6 +1451,15 @@ pub fn ChatWindow(
             let _ = eval.await;
         });
     });
+
+    {
+        let current_chat_id = current_chat_id.clone();
+        let mut visible_message_count = visible_message_count.clone();
+        use_effect(move || {
+            let _current = current_chat_id();
+            visible_message_count.set(160);
+        });
+    }
 
     let header_title = {
         if let Some(id) = current_chat_id() {
@@ -976,12 +1490,24 @@ pub fn ChatWindow(
             m
         }
     };
-    let mcp_display = if settings().mcp_server_command.trim().is_empty() {
+    let active_mcp_server = settings().active_mcp_server();
+    let active_mcp_server_present = active_mcp_server.is_some();
+    let active_mcp_server_name = active_mcp_server
+        .as_ref()
+        .map(|server| server.name.clone())
+        .unwrap_or_default();
+    let mcp_display = if active_mcp_server.is_none() {
         "MCP: not configured".to_string()
     } else if let Some(status) = mcp_status() {
-        format!("MCP: {status}")
+        format!(
+            "MCP: {} · {status}",
+            active_mcp_server_name
+        )
     } else {
-        "MCP: ready".to_string()
+        format!(
+            "MCP: {} · ready",
+            active_mcp_server_name
+        )
     };
     let corpus_display = format!(
         "Indexed corpus: {} files, {} chunks",
@@ -1016,20 +1542,13 @@ pub fn ChatWindow(
         ];
         move |chat_id: String, command_text: String, user_echo: Option<String>| {
             if let Some(display_text) = user_echo {
-                let conn = init_db();
-                let _ = conn.execute(
-                    "INSERT INTO messages (chat_id, role, content)
-                     VALUES (?1, 'user', ?2)",
-                    params![chat_id, display_text.clone()],
+                persist_and_push_message(
+                    current_chat_id,
+                    messages,
+                    &chat_id,
+                    "user",
+                    display_text,
                 );
-                enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-                if current_chat_id()
-                    .as_ref()
-                    .map(|c| c == &chat_id)
-                    .unwrap_or(false)
-                {
-                    messages.push(("user".into(), display_text));
-                }
             }
 
             mcp_status.set(Some("starting server".to_string()));
@@ -1039,8 +1558,20 @@ pub fn ChatWindow(
             spawn(async move {
                 mcp_status.set(Some("running command".to_string()));
                 rag_status.set(Some("MCP: running command...".to_string()));
-                let mcp_command = crate::db::load_settings(&init_db()).mcp_server_command;
-                let result = handle_mcp_command(&mcp_command, &command_text).await;
+                let current_settings = crate::db::load_settings(&init_db());
+                let Some(active_server) = current_settings.active_mcp_server() else {
+                    mcp_status.set(Some("error".to_string()));
+                    mcp_last_error.set(Some("No active MCP server is configured.".to_string()));
+                    rag_status.set(Some("MCP command failed: no active server configured.".to_string()));
+                    push_toast(
+                        toasts,
+                        ToastKind::Error,
+                        "MCP not configured",
+                        "Choose an active MCP integration in Settings first.",
+                    );
+                    return;
+                };
+                let result = handle_mcp_command(&active_server, &command_text).await;
                 let conn = init_db();
                 let assistant_text = match result {
                     Ok(output) => {
@@ -1081,19 +1612,8 @@ pub fn ChatWindow(
                     }
                 };
 
-                let _ = conn.execute(
-                    "INSERT INTO messages (chat_id, role, content)
-                     VALUES (?1, 'assistant', ?2)",
-                    params![chat_id, assistant_text],
-                );
-                enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-                if current_chat_id()
-                    .as_ref()
-                    .map(|c| c == &chat_id)
-                    .unwrap_or(false)
-                {
-                    messages.push(("assistant".into(), assistant_text));
-                }
+                persist_chat_message(&conn, &chat_id, "assistant", &assistant_text);
+                push_visible_message(current_chat_id, messages, &chat_id, "assistant", &assistant_text);
             });
         }
     };
@@ -1120,21 +1640,14 @@ pub fn ChatWindow(
             async move {
                 let s = settings();
                 if s.model.trim().is_empty() {
-                    let conn = init_db();
                     let db_msg = "Error: No model selected. Please open Settings and choose a model before sending messages.";
-                    conn.execute(
-                        "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
-                        params![chat_id, db_msg],
-                    ).ok();
-                    enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-
-                    if current_chat_id()
-                        .as_ref()
-                        .map(|c| c == &chat_id)
-                        .unwrap_or(false)
-                    {
-                        messages.push(("assistant".into(), db_msg.to_string()));
-                    }
+                    persist_and_push_message(
+                        current_chat_id,
+                        messages,
+                        &chat_id,
+                        "assistant",
+                        db_msg,
+                    );
 
                     push_toast(
                         toasts,
@@ -1178,9 +1691,11 @@ pub fn ChatWindow(
                     });
                 }
 
-                if !s.mcp_server_command.trim().is_empty() {
+                if let Some(active_server) = s.active_mcp_server() {
                     let mut mcp_note = format!(
-                        "MCP session state: {}.",
+                        "Active MCP integration: {} ({}).\nMCP session state: {}.",
+                        active_server.name,
+                        transport_label(&active_server.transport),
                         mcp_status().unwrap_or_else(|| "unknown".to_string())
                     );
                     if let Some(last_error) = mcp_last_error() {
@@ -1239,43 +1754,25 @@ pub fn ChatWindow(
                                 Ok(api_response) => {
                                     if cancel_flag.load(Ordering::Relaxed) {
                                     } else {
-                                        let conn = init_db();
-                                        let _ = conn.execute(
-                                            "INSERT INTO messages (chat_id, role, content)
-                                             VALUES (?1, 'assistant', ?2)",
-                                            params![chat_id, api_response.message.content],
+                                        persist_and_push_message(
+                                            current_chat_id,
+                                            messages,
+                                            &chat_id,
+                                            "assistant",
+                                            api_response.message.content,
                                         );
-                                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-
-                                        if current_chat_id()
-                                            .as_ref()
-                                            .map(|c| c == &chat_id)
-                                            .unwrap_or(false)
-                                        {
-                                            messages.push((
-                                                "assistant".into(),
-                                                api_response.message.content,
-                                            ));
-                                        }
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to parse Ollama response: {}", e);
                                     let err_text = "Error: Failed to parse response from Ollama";
-                                    let conn = init_db();
-                                    let _ = conn.execute(
-                                        "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
-                                        params![chat_id, err_text],
+                                    persist_and_push_message(
+                                        current_chat_id,
+                                        messages,
+                                        &chat_id,
+                                        "assistant",
+                                        err_text,
                                     );
-                                    enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-
-                                    if current_chat_id()
-                                        .as_ref()
-                                        .map(|c| c == &chat_id)
-                                        .unwrap_or(false)
-                                    {
-                                        messages.push(("assistant".into(), err_text.to_string()));
-                                    }
                                     push_toast(
                                         toasts,
                                         ToastKind::Error,
@@ -1288,26 +1785,13 @@ pub fn ChatWindow(
                             eprintln!("Ollama API error: {}", response.status());
                             let err_text =
                                 format!("Error: Ollama API returned status {}", response.status());
-                            let conn = init_db();
-                            let _ = conn.execute(
-                                "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
-                                params![chat_id, err_text],
+                            persist_and_push_message(
+                                current_chat_id,
+                                messages,
+                                &chat_id,
+                                "assistant",
+                                err_text,
                             );
-                            enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-
-                            if current_chat_id()
-                                .as_ref()
-                                .map(|c| c == &chat_id)
-                                .unwrap_or(false)
-                            {
-                                messages.push((
-                                    "assistant".into(),
-                                    format!(
-                                        "Error: Ollama API returned status {}",
-                                        response.status()
-                                    ),
-                                ));
-                            }
                             push_toast(
                                 toasts,
                                 ToastKind::Error,
@@ -1319,20 +1803,13 @@ pub fn ChatWindow(
                     Err(e) => {
                         eprintln!("Failed to send request to Ollama: {}", e);
                         let err_text = "Error: Could not connect to Ollama. Make sure Ollama is running at http://localhost:11434";
-                        let conn = init_db();
-                        let _ = conn.execute(
-                            "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
-                            params![chat_id, err_text],
+                        persist_and_push_message(
+                            current_chat_id,
+                            messages,
+                            &chat_id,
+                            "assistant",
+                            err_text,
                         );
-                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-
-                        if current_chat_id()
-                            .as_ref()
-                            .map(|c| c == &chat_id)
-                            .unwrap_or(false)
-                        {
-                            messages.push(("assistant".into(), err_text.to_string()));
-                        }
                         push_toast(
                             toasts,
                             ToastKind::Error,
@@ -1357,6 +1834,9 @@ pub fn ChatWindow(
         .map(|l| current_chat_id().as_ref().map(|c| c != l).unwrap_or(false))
         .unwrap_or(false);
     let has_model = !settings().model.trim().is_empty();
+    let total_messages = messages().len();
+    let hidden_message_count = total_messages.saturating_sub(visible_message_count());
+    let visible_start = total_messages.saturating_sub(visible_message_count());
     let can_send = current_chat_id().is_some()
         && has_model
         && (!input_text().trim().is_empty() || !pending_attachments().is_empty())
@@ -1386,7 +1866,7 @@ pub fn ChatWindow(
         "" => "Load MCP tools, then choose one.",
         _ => "Enter JSON arguments for this tool.",
     };
-    let mut submit_message = {
+    let submit_message = std::rc::Rc::new(std::cell::RefCell::new({
         to_owned![
             current_chat_id,
             input_text,
@@ -1440,18 +1920,13 @@ pub fn ChatWindow(
                 if !text.trim_start().starts_with("/mcp") {
                     if let Some(local_reply) = maybe_handle_mcp_meta_query(
                         &text,
-                        &settings().mcp_server_command,
+                        &active_mcp_server_name,
                         mcp_status(),
                         mcp_tools_cache(),
                         mcp_last_error(),
                     ) {
-                        let _ = conn.execute(
-                            "INSERT INTO messages (chat_id, role, content)
-                             VALUES (?1, 'assistant', ?2)",
-                            params![chat_id, local_reply],
-                        );
-                        enforce_history_limit(&conn, &chat_id, MAX_HISTORY_MESSAGES);
-                        messages.push(("assistant".into(), local_reply));
+                        persist_chat_message(&conn, &chat_id, "assistant", &local_reply);
+                        push_visible_message(current_chat_id, messages, &chat_id, "assistant", &local_reply);
                         push_toast(
                             toasts,
                             ToastKind::Info,
@@ -1489,7 +1964,37 @@ pub fn ChatWindow(
                 }
             }
         }
+    }));
+    let mut switch_active_mcp_server = {
+        to_owned![
+            settings,
+            mcp_status,
+            mcp_tools_cache,
+            mcp_last_error,
+            mcp_tool_entries,
+            selected_mcp_tool,
+            rag_status
+        ];
+        move |server_id: String| {
+            let mut next_settings = settings();
+            next_settings.active_mcp_server_id = server_id;
+            next_settings.mcp_server_command = next_settings
+                .active_mcp_server()
+                .map(|server| server.target)
+                .unwrap_or_default();
+            let conn = init_db();
+            save_settings(&conn, &next_settings);
+            settings.set(next_settings);
+            mcp_status.set(None);
+            mcp_tools_cache.set(None);
+            mcp_last_error.set(None);
+            mcp_tool_entries.set(Vec::new());
+            selected_mcp_tool.set(String::new());
+            rag_status.set(Some("Switched active MCP integration. Load tools for the new server.".to_string()));
+        }
     };
+    let submit_message_keydown = submit_message.clone();
+    let submit_message_click = submit_message.clone();
 
     rsx! {
         div { class: "chat-window",
@@ -1505,7 +2010,7 @@ pub fn ChatWindow(
                     }
 
                     div { class: "chat-header-actions",
-                        if !settings().mcp_server_command.trim().is_empty() {
+                        if active_mcp_server_present {
                             button {
                                 class: if show_mcp_workspace() { "header-workspace-btn active" } else { "header-workspace-btn" },
                                 onclick: move |_| show_mcp_workspace.set(!show_mcp_workspace()),
@@ -1534,11 +2039,20 @@ pub fn ChatWindow(
             }
 
             div { class: "chat-messages",
-                {messages().iter().map(|(role, content)| {
+                if hidden_message_count > 0 {
+                    button {
+                        class: "history-load-more",
+                        onclick: move |_| visible_message_count.set((visible_message_count() + 120).min(total_messages)),
+                        "Load {hidden_message_count} older messages"
+                    }
+                }
+                {messages().iter().skip(visible_start).map(|(role, content)| {
                     rsx! {
                         Message {
                             role: role.clone(),
-                            content: content.clone()
+                            content: content.clone(),
+                            code_execution_enabled: settings().allow_code_execution,
+                            execution_timeout_secs: settings().execution_timeout_secs
                         }
                     }
                 })}
@@ -1575,7 +2089,7 @@ pub fn ChatWindow(
 
                     if show_composer_tools() {
                         div { class: "composer-tools-popover",
-                            if !settings().mcp_server_command.trim().is_empty() {
+                            if active_mcp_server_present {
                                 button {
                                     class: if show_mcp_workspace() { "composer-tool-item active" } else { "composer-tool-item" },
                                     disabled: mcp_is_busy,
@@ -1750,7 +2264,7 @@ pub fn ChatWindow(
                         {
                             e.prevent_default();
                             if can_send {
-                                submit_message();
+                                (submit_message_keydown.borrow_mut())();
                             }
                         }
                     },
@@ -1768,14 +2282,14 @@ pub fn ChatWindow(
                             loading_chat.set(None);
                             current_cancel.set(None);
                         } else {
-                            submit_message();
+                            (submit_message_click.borrow_mut())();
                         }
                     },
                     if is_current_chat_loading { "■" } else { "➤" }
                 }
             }
 
-            if !settings().mcp_server_command.trim().is_empty() && show_mcp_workspace() {
+            if active_mcp_server_present && show_mcp_workspace() {
                 div {
                     class: "mcp-workspace-backdrop",
                     onclick: move |_| show_mcp_workspace.set(false),
@@ -1797,12 +2311,30 @@ pub fn ChatWindow(
 
                         div { class: "mcp-status-card",
                             span { class: "mcp-status-pill", "{mcp_display}" }
+                            if settings().mcp_servers.len() > 1 {
+                                div { class: "mcp-active-switcher",
+                                    label { class: "mcp-field-label", "Active integration" }
+                                    select {
+                                        class: "input mcp-tool-select",
+                                        value: "{settings().active_mcp_server_id}",
+                                        disabled: mcp_is_busy,
+                                        onchange: move |e| switch_active_mcp_server(e.value()),
+                                        {settings().mcp_servers.iter().map(|server| rsx!(
+                                            option { value: "{server.id}", selected: server.id == settings().active_mcp_server_id, "{server.name}" }
+                                        ))}
+                                    }
+                                }
+                            }
                             if let Some(err) = mcp_last_error() {
                                 p { class: "mcp-status-copy error", "{err}" }
                             } else if let Some(status) = rag_status() {
                                 p { class: "mcp-status-copy", "{status}" }
                             } else {
                                 p { class: "mcp-status-copy", "Use this workspace to load tools, inspect files, and run MCP actions without remembering command syntax." }
+                            }
+                            if let Some(server) = active_mcp_server.as_ref() {
+                                p { class: "mcp-status-copy", "Transport: {transport_label(&server.transport)}" }
+                                p { class: "mcp-status-copy", "Target: {server.target}" }
                             }
                         }
 
@@ -1929,12 +2461,37 @@ pub fn ChatWindow(
 /* ================= MESSAGE ================= */
 
 #[component]
-pub fn Message(role: String, content: String) -> Element {
+pub fn Message(
+    role: String,
+    content: String,
+    code_execution_enabled: bool,
+    execution_timeout_secs: i32,
+) -> Element {
     let (attachments, body_content) = parse_message_payload(&content);
     let class_name = if role == "user" {
         "message user-message"
     } else {
         "message assistant-message"
+    };
+    let parsed_mcp_tools = if role == "assistant" {
+        parse_mcp_tools_message(&body_content)
+    } else {
+        None
+    };
+    let parsed_mcp_files = if role == "assistant" {
+        parse_mcp_file_rows(&body_content)
+    } else {
+        None
+    };
+    let parsed_mcp_info = if role == "assistant" {
+        parse_mcp_info_rows(&body_content)
+    } else {
+        None
+    };
+    let mcp_error_text = if role == "assistant" && body_content.trim().starts_with("MCP Error:") {
+        Some(body_content.trim().trim_start_matches("MCP Error:").trim().to_string())
+    } else {
+        None
     };
 
     if body_content.contains("<think>") && body_content.contains("</think>") {
@@ -1951,7 +2508,11 @@ pub fn Message(role: String, content: String) -> Element {
                     AttachmentGallery { attachments: attachments.clone() }
                 }
                 {if !before_think.is_empty() {
-                    rsx! { Markdown { content: before_think.to_string() } }
+                    rsx! { Markdown {
+                        content: before_think.to_string(),
+                        code_execution_enabled,
+                        execution_timeout_secs,
+                    } }
                 } else {
                     rsx! { Fragment {} }
                 }}
@@ -1966,7 +2527,11 @@ pub fn Message(role: String, content: String) -> Element {
                 }
 
                 {if !after_think.is_empty() {
-                    rsx! { Markdown { content: after_think.to_string() } }
+                    rsx! { Markdown {
+                        content: after_think.to_string(),
+                        code_execution_enabled,
+                        execution_timeout_secs,
+                    } }
                 } else {
                     rsx! { Fragment {} }
                 }}
@@ -1979,8 +2544,85 @@ pub fn Message(role: String, content: String) -> Element {
                     AttachmentGallery { attachments: attachments.clone() }
                 }
                 if !body_content.trim().is_empty() {
-                    Markdown { content: body_content.clone() }
+                    if let Some(error_text) = mcp_error_text {
+                        McpErrorCard { message: error_text }
+                    } else if let Some(tools) = parsed_mcp_tools {
+                        McpToolsCard { tools }
+                    } else if let Some(rows) = parsed_mcp_files {
+                        McpFileListCard { rows }
+                    } else if let Some(rows) = parsed_mcp_info {
+                        McpInfoCard { rows }
+                    } else {
+                        Markdown {
+                            content: body_content.clone(),
+                            code_execution_enabled,
+                            execution_timeout_secs,
+                        }
+                    }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn McpErrorCard(message: String) -> Element {
+    rsx! {
+        div { class: "mcp-result-card error",
+            span { class: "mcp-result-kicker", "MCP Error" }
+            p { class: "mcp-result-copy", "{message}" }
+        }
+    }
+}
+
+#[component]
+fn McpToolsCard(tools: Vec<(String, String)>) -> Element {
+    rsx! {
+        div { class: "mcp-result-card",
+            span { class: "mcp-result-kicker", "Available Tools" }
+            div { class: "mcp-tool-grid",
+                {tools.iter().map(|(name, description)| rsx!(
+                    div { class: "mcp-tool-chip-card",
+                        strong { "{name}" }
+                        if !description.is_empty() {
+                            p { "{description}" }
+                        }
+                    }
+                ))}
+            }
+        }
+    }
+}
+
+#[component]
+fn McpFileListCard(rows: Vec<(String, String)>) -> Element {
+    rsx! {
+        div { class: "mcp-result-card",
+            span { class: "mcp-result-kicker", "Filesystem Result" }
+            div { class: "mcp-file-list",
+                {rows.iter().map(|(kind, name)| rsx!(
+                    div { class: "mcp-file-row",
+                        span { class: "mcp-file-kind", "{kind}" }
+                        span { class: "mcp-file-name", "{name}" }
+                    }
+                ))}
+            }
+        }
+    }
+}
+
+#[component]
+fn McpInfoCard(rows: Vec<(String, String)>) -> Element {
+    rsx! {
+        div { class: "mcp-result-card",
+            span { class: "mcp-result-kicker", "Details" }
+            div { class: "mcp-info-list",
+                {rows.iter().map(|(key, value)| rsx!(
+                    div { class: "mcp-info-row",
+                        span { class: "mcp-info-key", "{key}" }
+                        span { class: "mcp-info-value", "{value}" }
+                    }
+                ))}
             }
         }
     }
@@ -2050,7 +2692,7 @@ fn AttachmentGallery(attachments: Vec<ChatAttachment>) -> Element {
 
 fn maybe_handle_mcp_meta_query(
     user_text: &str,
-    mcp_server_command: &str,
+    active_mcp_server_name: &str,
     mcp_status: Option<String>,
     mcp_tools_cache: Option<String>,
     mcp_last_error: Option<String>,
@@ -2086,10 +2728,10 @@ fn maybe_handle_mcp_meta_query(
         return Some(match mcp_tools_cache {
             Some(tools) => format!("The last MCP tools listing for this session was:\n\n{tools}"),
             None => {
-                if mcp_server_command.trim().is_empty() {
+                if active_mcp_server_name.trim().is_empty() {
                     "No MCP server is configured yet, so there is no tool list available.".to_string()
                 } else {
-                    "I don't have a cached MCP tool list yet in this session. Run `/mcp tools` first, then I can answer normal questions about the available MCP tools.".to_string()
+                    format!("I don't have a cached MCP tool list yet for `{active_mcp_server_name}`. Run `/mcp tools` first, then I can answer normal questions about the available MCP tools.")
                 }
             }
         });
@@ -2115,10 +2757,10 @@ fn maybe_handle_mcp_meta_query(
                 }
             }
             _ => {
-                if mcp_server_command.trim().is_empty() {
+                if active_mcp_server_name.trim().is_empty() {
                     "No MCP server is configured yet in Settings.".to_string()
                 } else {
-                    "I don't have a confirmed MCP status yet for this session. Run `/mcp tools` once, then I can answer normal MCP status questions from the cached result.".to_string()
+                    format!("I don't have a confirmed MCP status yet for `{active_mcp_server_name}`. Run `/mcp tools` once, then I can answer normal MCP status questions from the cached result.")
                 }
             }
         });
